@@ -50,6 +50,7 @@ class MainActivity : Activity() {
     private lateinit var btnShowOverlay: TextView
 
     private lateinit var etMessages: EditText
+    private lateinit var etSingleShotText: EditText
     private lateinit var rgMode: RadioGroup
     private lateinit var rbRandom: Button
     private lateinit var rbSequential: Button
@@ -109,6 +110,7 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        syncSingleShotFieldIfIdle()
         val accEnabled = isAccessibilityEnabled()
         val overlayGranted = isOverlayGranted()
         if (accEnabled) {
@@ -128,6 +130,7 @@ class MainActivity : Activity() {
     override fun onPause() {
         persistMessages()
         persistTargetIfValid()
+        persistSingleShotText()
         stopQuickTicker()
         super.onPause()
     }
@@ -146,6 +149,7 @@ class MainActivity : Activity() {
         btnQuickStop = findViewById(R.id.btnQuickStop)
         btnShowOverlay = findViewById(R.id.btnShowOverlay)
         etMessages = findViewById(R.id.etMessages)
+        etSingleShotText = findViewById(R.id.etSingleShotText)
         rgMode = findViewById(R.id.rgMode)
         rbRandom = findViewById(R.id.rbRandom)
         rbSequential = findViewById(R.id.rbSequential)
@@ -170,6 +174,7 @@ class MainActivity : Activity() {
     private fun loadSettingsIntoUi() {
         val settings = AppConfig.load(this)
         etMessages.setText(settings.messages.joinToString("\n"))
+        etSingleShotText.setText(settings.singleShotText)
         rgMode.check(if (settings.randomMode) R.id.rbRandom else R.id.rbSequential)
         swSuffix.isChecked = settings.suffixEnabled
         cbSuffixSymbol.isChecked = settings.suffixSymbols
@@ -196,6 +201,24 @@ class MainActivity : Activity() {
                 uiHandler.postDelayed(saveMessagesRunnable, 350L)
             }
         })
+
+        etSingleShotText.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = Unit
+            override fun afterTextChanged(s: Editable?) {
+                persistSingleShotText()
+            }
+        })
+        etSingleShotText.setOnFocusChangeListener { _, hasFocus ->
+            if (!hasFocus) {
+                if (etSingleShotText.text?.toString()?.trim().isNullOrEmpty()) {
+                    etSingleShotText.error = getString(R.string.single_shot_empty)
+                } else {
+                    etSingleShotText.error = null
+                    persistSingleShotText()
+                }
+            }
+        }
 
         rgMode.setOnCheckedChangeListener { _, checkedId ->
             when (checkedId) {
@@ -329,6 +352,23 @@ class MainActivity : Activity() {
         AppConfig.saveMessages(this, etMessages.text?.toString().orEmpty())
     }
 
+    private fun persistSingleShotText() {
+        val text = etSingleShotText.text?.toString()?.trim().orEmpty()
+        if (text.isNotEmpty()) {
+            etSingleShotText.error = null
+            AppConfig.saveSingleShotText(this, text)
+        }
+    }
+
+    private fun syncSingleShotFieldIfIdle() {
+        if (etSingleShotText.hasFocus()) return
+        val preferred = AppConfig.load(this).singleShotText
+        if (etSingleShotText.text?.toString() != preferred) {
+            etSingleShotText.setText(preferred)
+            etSingleShotText.setSelection(etSingleShotText.text?.length ?: 0)
+        }
+    }
+
     private fun persistTargetIfValid() {
         uiHandler.removeCallbacks(saveTargetRunnable)
         val packageName = etTargetPackage.text?.toString()?.trim().orEmpty()
@@ -397,7 +437,15 @@ class MainActivity : Activity() {
         if (!validateAndPersistTarget(showError = true, silent = !showFeedback)) {
             return false
         }
+        val singleShot = etSingleShotText.text?.toString()?.trim().orEmpty()
+        if (singleShot.isEmpty()) {
+            etSingleShotText.error = getString(R.string.single_shot_empty)
+            if (showFeedback) toast(getString(R.string.single_shot_empty))
+            return false
+        }
+        etSingleShotText.error = null
         AppConfig.saveMessages(this, messages)
+        AppConfig.saveSingleShotText(this, singleShot)
         persistSuffix()
         persistIntervals()
         AppConfig.saveRandomMode(this, rgMode.checkedRadioButtonId == R.id.rbRandom)

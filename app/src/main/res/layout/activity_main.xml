@@ -409,6 +409,45 @@
                     android:textColor="@color/text"
                     android:textSize="13sp" />
             </RadioGroup>
+
+            <View
+                android:layout_width="match_parent"
+                android:layout_height="1dp"
+                android:layout_marginTop="12dp"
+                android:layout_marginBottom="12dp"
+                android:background="@color/stroke" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/label_single_shot"
+                android:textColor="@color/text_dim"
+                android:textSize="12sp" />
+
+            <EditText
+                android:id="@+id/etSingleShotText"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:layout_marginTop="6dp"
+                android:background="@drawable/bg_input"
+                android:hint="@string/hint_single_shot"
+                android:inputType="text"
+                android:maxLines="1"
+                android:paddingStart="12dp"
+                android:paddingEnd="12dp"
+                android:singleLine="true"
+                android:textColor="@color/text"
+                android:textColorHint="@color/text_muted"
+                android:textSize="14sp" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="5dp"
+                android:text="@string/single_shot_hint"
+                android:textColor="@color/text_muted"
+                android:textSize="10sp"
+                android:lineSpacingExtra="2dp" />
         </LinearLayout>
 
         <!-- Suffix -->
@@ -748,7 +787,7 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="12dp"
             android:gravity="center"
-            android:text="v1.0.0 · debug · 仅本人自用"
+            android:text="v1.1.0 · debug · 仅本人自用"
             android:textColor="@color/text_muted"
             android:textSize="10sp" />
     </LinearLayout>

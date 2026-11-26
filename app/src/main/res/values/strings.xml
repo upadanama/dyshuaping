@@ -9,7 +9,7 @@
     <string name="notification_title">抖屏助手</string>
 
     <string name="main_title">抖屏助手</string>
-    <string name="main_subtitle">抖音直播间自动评论 · 本机调试版 v1.0.0</string>
+    <string name="main_subtitle">抖音直播间自动评论 · 本机调试版 v1.1.0</string>
     <string name="section_permissions">运行权限</string>
     <string name="permission_overlay_title">悬浮窗权限</string>
     <string name="permission_overlay_desc">显示开始 / 暂停 / 停止悬浮面板</string>
@@ -46,6 +46,19 @@
     <string name="label_send_mode">发送模式</string>
     <string name="mode_random">随机抽取</string>
     <string name="mode_sequential">顺序循环</string>
+    <string name="label_single_shot">补发内容（单发，不追加后缀）</string>
+    <string name="hint_single_shot">怎么回事？发不了了</string>
+    <string name="single_shot_hint">仅用于补发测试；点击悬浮窗「补发一次」时原样发送，不会自动进入主循环。</string>
+    <string name="single_shot_editor_title">修改补发内容</string>
+    <string name="single_shot_empty">补发内容不能为空</string>
+    <string name="single_shot_saved">补发内容已更新</string>
+    <string name="action_single_shot">补发一次</string>
+    <string name="single_shot_need_pause">请先暂停</string>
+    <string name="single_shot_need_target">请先进入抖音直播间</string>
+    <string name="single_shot_result_sent">已发出</string>
+    <string name="single_shot_result_no_input">未发出：找不到输入框</string>
+    <string name="single_shot_result_text_failed">未发出：文字没进去（输入框为空或内容不匹配）</string>
+    <string name="single_shot_result_button_disabled">未发出：发送按钮不可点（大概率被禁言）</string>
 
     <string name="section_suffix">防重复后缀</string>
     <string name="label_suffix_enabled">启用后缀（避免短时间重复同一句）</string>

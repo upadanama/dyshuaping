@@ -1,5 +1,7 @@
 package com.mqx.dyshuaping
 
+import android.app.AlertDialog
+import android.content.Context
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Typeface
@@ -12,10 +14,12 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import android.view.inputmethod.InputMethodManager
 import androidx.core.content.ContextCompat
 import kotlin.math.abs
 import kotlin.math.ceil
@@ -52,6 +56,8 @@ class FloatingOverlay(
     private var btnPause: TextView? = null
     private var btnStop: TextView? = null
     private var btnTrial: TextView? = null
+    private var btnSingleShot: TextView? = null
+    private var singleShotResultView: TextView? = null
     private var btnDump: TextView? = null
     private var btnCalibrate: TextView? = null
 
@@ -63,6 +69,7 @@ class FloatingOverlay(
                 return
             }
             updateCountdown()
+            updateSingleShotUi(engine.snapshot())
             mainHandler.postDelayed(this, 500L)
         }
     }
@@ -130,6 +137,7 @@ class FloatingOverlay(
         )
         setActionEnabled(btnDump, !ui.roundActive)
         setActionEnabled(btnCalibrate, !ui.roundActive)
+        updateSingleShotUi(ui)
         applyTouchability(!ui.roundActive)
         if (expanded && !tickerRunning) startTicker()
         if (!expanded) stopTicker()
@@ -283,6 +291,19 @@ class FloatingOverlay(
             LinearLayout.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = dp(5f) })
 
+        val singleResult = TextView(service).apply {
+            visibility = View.GONE
+            gravity = Gravity.CENTER
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+            setPadding(dp(10f), dp(8f), dp(10f), dp(8f))
+        }
+        singleShotResultView = singleResult
+        container.addView(singleResult, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(8f) })
+
         val actionRow = LinearLayout(service).apply {
             orientation = LinearLayout.HORIZONTAL
         }
@@ -316,9 +337,16 @@ class FloatingOverlay(
             orientation = LinearLayout.HORIZONTAL
         }
         val trial = actionButton("试一轮", R.drawable.bg_button_ghost, ContextCompat.getColor(service, R.color.text))
+        val singleShot = actionButton(
+            service.getString(R.string.action_single_shot),
+            R.drawable.bg_button_ghost,
+            ContextCompat.getColor(service, R.color.text)
+        )
         val dump = actionButton("抓节点", R.drawable.bg_button_ghost, ContextCompat.getColor(service, R.color.text))
         btnTrial = trial
+        btnSingleShot = singleShot
         btnDump = dump
+        singleShot.contentDescription = "补发一次，长按修改补发内容"
         trial.setOnClickListener {
             val state = engine.snapshot()
             if (state.roundActive || state.trialRunning || state.phase == AutomationEngine.Phase.RUNNING) {
@@ -327,14 +355,22 @@ class FloatingOverlay(
                 engine.trialOnce()
             }
         }
+        singleShot.setOnClickListener {
+            engine.singleShotOnce()
+        }
+        singleShot.setOnLongClickListener {
+            showSingleShotEditor()
+            true
+        }
         dump.setOnClickListener {
             NodeDump.captureAndShare(service)
         }
         toolsRow.addView(trial, rowButtonParams(0f))
+        toolsRow.addView(singleShot, rowButtonParams(8f))
         toolsRow.addView(dump, rowButtonParams(8f))
         container.addView(toolsRow, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
-            dp(42f)
+            dp(44f)
         ).apply { topMargin = dp(8f) })
 
         val bottomRow = LinearLayout(service).apply {
@@ -520,6 +556,118 @@ class FloatingOverlay(
         }
     }
 
+    private fun updateSingleShotUi(ui: AutomationEngine.UiState) {
+        val button = btnSingleShot ?: return
+        val now = android.os.SystemClock.elapsedRealtime()
+        val coolingDown = now < ui.singleShotCooldownUntilElapsed
+        setActionEnabled(button, !ui.singleShotRunning && !coolingDown)
+
+        val banner = singleShotResultView ?: return
+        val result = ui.singleShotResult
+        val resultAge = if (ui.singleShotResultAtElapsed > 0L) now - ui.singleShotResultAtElapsed else Long.MAX_VALUE
+        val shouldShow = result != null && resultAge in 0L..5000L
+        val wasShown = banner.visibility == View.VISIBLE
+        if (shouldShow && result != null) {
+            val color = singleShotResultColor(result)
+            banner.visibility = View.VISIBLE
+            banner.text = singleShotResultText(result)
+            banner.setTextColor(color)
+            banner.background = singleShotBannerDrawable(color)
+        } else {
+            banner.visibility = View.GONE
+        }
+        if (shouldShow != wasShown && expanded) {
+            root?.post { clampPanel() }
+        }
+    }
+
+    private fun singleShotResultText(result: AutomationEngine.CycleResult): String {
+        return when {
+            result.success -> service.getString(R.string.single_shot_result_sent)
+            result.failureStage == AutomationEngine.CycleFailureStage.LOCATE_INPUT ->
+                service.getString(R.string.single_shot_result_no_input)
+            result.failureStage == AutomationEngine.CycleFailureStage.INPUT_TEXT ->
+                service.getString(R.string.single_shot_result_text_failed)
+            else -> service.getString(R.string.single_shot_result_button_disabled)
+        }
+    }
+
+    private fun singleShotResultColor(result: AutomationEngine.CycleResult): Int {
+        return when {
+            result.success -> ContextCompat.getColor(service, R.color.green)
+            result.failureStage == AutomationEngine.CycleFailureStage.LOCATE_INPUT ||
+                result.failureStage == AutomationEngine.CycleFailureStage.INPUT_TEXT ->
+                ContextCompat.getColor(service, R.color.amber)
+            else -> ContextCompat.getColor(service, R.color.red)
+        }
+    }
+
+    private fun singleShotBannerDrawable(color: Int): GradientDrawable {
+        return GradientDrawable().apply {
+            cornerRadius = dp(10f).toFloat()
+            setColor(Color.argb(38, Color.red(color), Color.green(color), Color.blue(color)))
+            setStroke(dp(1f), Color.argb(150, Color.red(color), Color.green(color), Color.blue(color)))
+        }
+    }
+
+    private fun showSingleShotEditor() {
+        try {
+            val current = AppConfig.load(service).singleShotText
+            val input = EditText(service).apply {
+                setText(current)
+                setSelection(current.length)
+                setSingleLine(true)
+                maxLines = 1
+                hint = service.getString(R.string.hint_single_shot)
+                setTextColor(ContextCompat.getColor(service, R.color.text))
+                setHintTextColor(ContextCompat.getColor(service, R.color.text_muted))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                background = ContextCompat.getDrawable(service, R.drawable.bg_input)?.mutate()
+                setPadding(dp(12f), dp(9f), dp(12f), dp(9f))
+            }
+            val wrapper = LinearLayout(service).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(20f), dp(8f), dp(20f), 0)
+                addView(input, LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    dp(50f)
+                ))
+            }
+            val dialog = AlertDialog.Builder(service)
+                .setTitle(service.getString(R.string.single_shot_editor_title))
+                .setView(wrapper)
+                .setPositiveButton("保存") { _, _ ->
+                    val value = input.text?.toString()?.trim().orEmpty()
+                    if (value.isEmpty()) {
+                        toast(service.getString(R.string.single_shot_empty))
+                    } else {
+                        AppConfig.saveSingleShotText(service, value)
+                        toast(service.getString(R.string.single_shot_saved))
+                    }
+                }
+                .setNegativeButton("取消", null)
+                .create()
+            dialog.window?.apply {
+                setType(overlayWindowType())
+                setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE)
+            }
+            dialog.setOnShowListener {
+                input.requestFocus()
+                input.post {
+                    try {
+                        val imm = service.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+                        imm.showSoftInput(input, InputMethodManager.SHOW_IMPLICIT)
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
+            dialog.show()
+        } catch (t: Throwable) {
+            LogStore.add("补发", "打开补发内容编辑框失败：${t.javaClass.simpleName}: ${t.message}")
+            toast("打开编辑框失败，请到 App 设置中修改补发内容")
+        }
+    }
+
     private fun updateCountdown() {
         val view = countdownText ?: return
         val ui = engine.snapshot()
@@ -558,17 +706,20 @@ class FloatingOverlay(
         safeUpdateLayout(p)
     }
 
-    private fun baseParams(): WindowManager.LayoutParams {
-        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+    private fun overlayWindowType(): Int {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         } else {
             @Suppress("DEPRECATION")
             WindowManager.LayoutParams.TYPE_PHONE
         }
+    }
+
+    private fun baseParams(): WindowManager.LayoutParams {
         return WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
-            type,
+            overlayWindowType(),
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
@@ -600,6 +751,8 @@ class FloatingOverlay(
         btnPause = null
         btnStop = null
         btnTrial = null
+        btnSingleShot = null
+        singleShotResultView = null
         btnDump = null
         btnCalibrate = null
         if (view != null) {

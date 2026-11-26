@@ -29,8 +29,43 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
         val nextRoundAtElapsed: Long,
         val roundActive: Boolean,
         val trialRunning: Boolean,
-        val statusMessage: String
+        val statusMessage: String,
+        val singleShotRunning: Boolean,
+        val singleShotCooldownUntilElapsed: Long,
+        val singleShotResult: CycleResult?,
+        val singleShotResultAtElapsed: Long
     )
+
+    enum class CycleFailureStage {
+        NONE,
+        LOCATE_INPUT,
+        INPUT_TEXT,
+        CLICK_SEND,
+        VERIFY
+    }
+
+    data class CycleTimings(
+        val locateMs: Long,
+        val inputMs: Long,
+        val sendMs: Long,
+        val verifyMs: Long,
+        val totalMs: Long
+    )
+
+    data class CycleResult(
+        val success: Boolean,
+        val failureStage: CycleFailureStage,
+        val error: String?,
+        val banSuspected: Boolean,
+        val timings: CycleTimings,
+        val content: String
+    )
+
+    private enum class CycleOrigin {
+        MAIN_LOOP,
+        TRIAL,
+        SINGLE_SHOT
+    }
 
     private enum class InputStrategy {
         SET_TEXT,
@@ -60,13 +95,31 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
     private var operationEpoch = 0
     private var roundActive = false
     private var trialRunning = false
-    private var currentRoundIsTrial = false
+    private var cycleOrigin = CycleOrigin.MAIN_LOOP
     private var roundSequence = 0
     private var activeOutgoing: Outgoing? = null
     private var targetForRound = ""
 
     private var trialRestorePhase = Phase.IDLE
     private var trialRestoreStatus = "未开始"
+
+    private var singleShotRunning = false
+    private var singleShotCooldownUntilElapsed = 0L
+    private var lastSingleShotResult: CycleResult? = null
+    private var lastSingleShotResultAtElapsed = 0L
+    private var singleShotRestorePhase = Phase.PAUSED
+    private var singleShotRestoreStatus = ""
+
+    private var currentCycleStage = CycleFailureStage.NONE
+    private var currentCycleBanSuspected = false
+    private var cycleStartedAtElapsed = 0L
+    private var locateFinishedAtElapsed = 0L
+    private var inputStartedAtElapsed = 0L
+    private var inputFinishedAtElapsed = 0L
+    private var sendStartedAtElapsed = 0L
+    private var sendFinishedAtElapsed = 0L
+    private var verifyStartedAtElapsed = 0L
+    private var cycleContentSnapshot = ""
 
     private var sendDisabledGrace = 0
     private var sendMissingGrace = 0
@@ -82,12 +135,16 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
         statusMessage = when {
             trialRunning -> "试跑中 · $statusMessage"
             else -> statusMessage
-        }
+        },
+        singleShotRunning = singleShotRunning,
+        singleShotCooldownUntilElapsed = singleShotCooldownUntilElapsed,
+        singleShotResult = lastSingleShotResult,
+        singleShotResultAtElapsed = lastSingleShotResultAtElapsed
     )
 
     fun start() {
         if (destroyed) return
-        if (trialRunning || roundActive) {
+        if (trialRunning || roundActive || singleShotRunning) {
             toast("正在执行，请稍候")
             return
         }
@@ -116,7 +173,7 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
         val resuming = phase != Phase.IDLE
         cancelPendingCallbacks()
         trialRunning = false
-        currentRoundIsTrial = false
+        cycleOrigin = CycleOrigin.MAIN_LOOP
         roundActive = false
         activeOutgoing = null
         failureCount = 0
@@ -135,16 +192,22 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
 
     fun pause() {
         if (destroyed) return
-        if (phase == Phase.IDLE && !roundActive && !trialRunning) return
+        if (phase == Phase.IDLE && !roundActive && !trialRunning && !singleShotRunning) return
         val wasTrial = trialRunning
+        val wasSingleShot = singleShotRunning
         cancelPendingCallbacks()
         roundActive = false
         nextRoundAtElapsed = 0L
         activeOutgoing = null
         trialRunning = false
-        currentRoundIsTrial = false
+        singleShotRunning = false
+        cycleOrigin = CycleOrigin.MAIN_LOOP
         phase = Phase.PAUSED
-        statusMessage = if (wasTrial) "已暂停（试跑已取消），计数保留" else "已暂停，计数保留"
+        statusMessage = when {
+            wasTrial -> "已暂停（试跑已取消），计数保留"
+            wasSingleShot -> "已暂停（补发已取消），计数保留"
+            else -> "已暂停，计数保留"
+        }
         LogStore.add("状态", "手动暂停，已发送 $sentCount 条")
         notifyChanged()
     }
@@ -155,7 +218,8 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
         phase = Phase.IDLE
         roundActive = false
         trialRunning = false
-        currentRoundIsTrial = false
+        singleShotRunning = false
+        cycleOrigin = CycleOrigin.MAIN_LOOP
         nextRoundAtElapsed = 0L
         sentCount = 0
         failureCount = 0
@@ -176,7 +240,7 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
 
     fun trialOnce() {
         if (destroyed) return
-        if (roundActive || trialRunning) {
+        if (roundActive || trialRunning || singleShotRunning) {
             toast("正在执行，请稍候")
             return
         }
@@ -200,13 +264,61 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
         trialRestorePhase = phase
         trialRestoreStatus = statusMessage
         trialRunning = true
-        currentRoundIsTrial = true
+        cycleOrigin = CycleOrigin.TRIAL
         roundActive = false
         phase = if (phase == Phase.WAITING_TARGET) Phase.PAUSED else phase
         statusMessage = "准备手动试跑"
         LogStore.add("试跑", "开始手动试跑一轮")
         notifyChanged()
         beginRound(isTrial = true)
+    }
+
+    /**
+     * 补发一次：one shared runOneCycle, fixed text, no suffix, no loop resumption.
+     */
+    fun singleShotOnce() {
+        if (destroyed) return
+        if (singleShotRunning) return
+        val now = SystemClock.elapsedRealtime()
+        if (now < singleShotCooldownUntilElapsed) return
+        if (roundActive || trialRunning || phase == Phase.RUNNING || phase == Phase.WAITING_TARGET) {
+            toast(service.getString(R.string.single_shot_need_pause))
+            return
+        }
+        if (phase != Phase.PAUSED && phase != Phase.IDLE) {
+            toast(service.getString(R.string.single_shot_need_pause))
+            return
+        }
+        val settings = AppConfig.load(service)
+        if (settings.targetPackage.isBlank()) {
+            toast("请先在设置中填写目标包名")
+            return
+        }
+        val active = NodeTools.activePackage(service)
+        if (active == null || active != settings.targetPackage) {
+            LogStore.add("补发", "未开始：当前前台不是目标应用。前台=${active ?: "<null>"} 目标=${settings.targetPackage}")
+            toast(service.getString(R.string.single_shot_need_target))
+            return
+        }
+
+        val content = settings.singleShotText.ifBlank { AppConfig.DEFAULT_SINGLE_SHOT_TEXT }
+        cancelPendingCallbacks()
+        singleShotRestorePhase = phase
+        singleShotRestoreStatus = statusMessage
+        singleShotRunning = true
+        cycleOrigin = CycleOrigin.SINGLE_SHOT
+        singleShotCooldownUntilElapsed = now + 3000L
+        lastSingleShotResult = null
+        lastSingleShotResultAtElapsed = 0L
+        statusMessage = "补发中：准备开始"
+        LogStore.add("补发", "开始补发一次，内容=\"$content\"")
+        notifyChanged()
+        runOneCycle(
+            baseText = content,
+            appendSuffix = false,
+            origin = CycleOrigin.SINGLE_SHOT,
+            settings = settings
+        )
     }
 
     fun onForegroundPackageChanged(packageName: String) {
@@ -224,6 +336,10 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
             }
             return
         }
+        if (singleShotRunning) {
+            handleWrongForeground(packageName)
+            return
+        }
         if (phase == Phase.RUNNING) {
             handleWrongForeground(packageName)
         }
@@ -231,11 +347,12 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
 
     fun onInterrupt() {
         if (destroyed) return
-        if (phase == Phase.IDLE && !roundActive && !trialRunning) return
+        if (phase == Phase.IDLE && !roundActive && !trialRunning && !singleShotRunning) return
         cancelPendingCallbacks()
         roundActive = false
         trialRunning = false
-        currentRoundIsTrial = false
+        singleShotRunning = false
+        cycleOrigin = CycleOrigin.MAIN_LOOP
         nextRoundAtElapsed = 0L
         activeOutgoing = null
         phase = Phase.PAUSED
@@ -247,6 +364,7 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
     fun destroy() {
         destroyed = true
         cancelPendingCallbacks()
+        singleShotRunning = false
         activeOutgoing = null
         onChanged = null
         handler.removeCallbacksAndMessages(null)
@@ -296,7 +414,7 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
         }
         cancelPendingCallbacks()
         roundActive = true
-        currentRoundIsTrial = isTrial
+        cycleOrigin = if (isTrial) CycleOrigin.TRIAL else CycleOrigin.MAIN_LOOP
         sendDisabledGrace = 0
         sendMissingGrace = 0
         sendRootRetry = 0
@@ -330,16 +448,61 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
             failRound("没有可发送的消息")
             return
         }
-        val suffix = SuffixGenerator.build(settings)
-        val fullText = base + suffix
-        roundSequence++
-        val outgoing = Outgoing(settings, base, suffix, fullText, roundSequence)
-        activeOutgoing = outgoing
-        statusMessage = "第${roundSequence}轮：定位输入框"
-        LogStore.add(
-            "轮次",
-            "开始第${roundSequence}轮（${if (isTrial) "手动试跑" else "自动"}），目标=${targetForRound}，文本=\"$fullText\""
+        runOneCycle(
+            baseText = base,
+            appendSuffix = true,
+            origin = if (isTrial) CycleOrigin.TRIAL else CycleOrigin.MAIN_LOOP,
+            settings = settings
         )
+    }
+
+    /**
+     * Shared single-cycle implementation used by the main loop, 试一轮 and 补发一次.
+     * Callers have already checked permissions/foreground and main-loop state.
+     * The asynchronous completion is delivered through onRoundSuccess/failRound.
+     */
+    private fun runOneCycle(
+        baseText: String,
+        appendSuffix: Boolean,
+        origin: CycleOrigin,
+        settings: Settings
+    ) {
+        if (destroyed) return
+        roundActive = true
+        cycleOrigin = origin
+        sendDisabledGrace = 0
+        sendMissingGrace = 0
+        sendRootRetry = 0
+        sendRefillCount = 0
+        currentCycleStage = CycleFailureStage.LOCATE_INPUT
+        currentCycleBanSuspected = false
+        cycleStartedAtElapsed = SystemClock.elapsedRealtime()
+        locateFinishedAtElapsed = 0L
+        inputStartedAtElapsed = 0L
+        inputFinishedAtElapsed = 0L
+        sendStartedAtElapsed = 0L
+        sendFinishedAtElapsed = 0L
+        verifyStartedAtElapsed = 0L
+        targetForRound = settings.targetPackage
+
+        val roundNumber = if (origin == CycleOrigin.SINGLE_SHOT) 0 else ++roundSequence
+        val suffix = if (appendSuffix) SuffixGenerator.build(settings) else ""
+        val fullText = baseText + suffix
+        cycleContentSnapshot = fullText
+        val outgoing = Outgoing(settings, baseText, suffix, fullText, roundNumber)
+        activeOutgoing = outgoing
+
+        statusMessage = if (origin == CycleOrigin.SINGLE_SHOT) {
+            "补发中：定位输入框"
+        } else {
+            "第${roundNumber}轮：定位输入框"
+        }
+        val logMessage = when (origin) {
+            CycleOrigin.SINGLE_SHOT -> "开始补发一次，内容=\"$fullText\""
+            CycleOrigin.TRIAL -> "开始第${roundNumber}轮（手动试跑），目标=${targetForRound}，文本=\"$fullText\""
+            CycleOrigin.MAIN_LOOP -> "开始第${roundNumber}轮（自动），目标=${targetForRound}，文本=\"$fullText\""
+        }
+        LogStore.add(if (origin == CycleOrigin.SINGLE_SHOT) "补发" else "轮次", logMessage)
         notifyChanged()
         locateInput(0)
     }
@@ -376,6 +539,7 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
             if (isOperationActive()) failRound("输入框点击未被系统接受")
             return
         }
+        markLocateFinished()
         setStatus("已点击输入框，等待键盘")
         later(randomBetween(450, 650).toLong()) { beginTextEntry(1) }
     }
@@ -396,6 +560,7 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
             if (isOperationActive()) failRound("校准坐标点击输入框失败")
             return
         }
+        markLocateFinished()
         setStatus("使用校准坐标，等待键盘")
         later(500L) { beginTextEntry(1) }
     }
@@ -407,6 +572,7 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
             failRound("输入重试次数耗尽")
             return
         }
+        markStage(CycleFailureStage.INPUT_TEXT)
         setStatus("写入文字（第${attempt}次）")
         val target = targetForRound
         val screen = ScreenUtils.realSize(service)
@@ -522,6 +688,7 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
                 "verified=$verified，$source text=\"${actual.take(80)}\""
         )
         if (verified) {
+            markInputFinished()
             setStatus("文字已写入，准备点击发送")
             later(280L) { tapSend() }
             return
@@ -548,6 +715,7 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
     private fun tapSend() {
         if (!isOperationActive()) return
         if (!ensureTargetForeground()) return
+        markStage(CycleFailureStage.CLICK_SEND)
         setStatus("查找发送按钮")
         val target = targetForRound
         val screen = ScreenUtils.realSize(service)
@@ -576,6 +744,7 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
         }
 
         if (lookup.disabled) {
+            currentCycleBanSuspected = true
             LogStore.add("发送", "发送按钮不可点击/置灰：${lookup.detail}")
             if (sendDisabledGrace < 1) {
                 sendDisabledGrace++
@@ -600,6 +769,7 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
             if (isOperationActive()) failRound("发送按钮点击未被系统接受")
             return
         }
+        markSendFinished()
         setStatus("已点击发送，校验结果")
         later(randomBetween(800, 1500).toLong()) { checkSendResult(first = true) }
     }
@@ -607,6 +777,7 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
     private fun fallbackSend(reason: String) {
         if (!isOperationActive()) return
         if (!ensureTargetForeground()) return
+        markStage(CycleFailureStage.CLICK_SEND)
         val settings = activeOutgoing?.settings ?: AppConfig.load(service)
         if (!settings.hasCalibration) {
             failRound("$reason，且尚未校准发送按钮坐标")
@@ -620,6 +791,7 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
             if (isOperationActive()) failRound("校准坐标点击发送按钮失败")
             return
         }
+        markSendFinished()
         setStatus("已点击校准发送坐标，校验结果")
         later(randomBetween(800, 1500).toLong()) { checkSendResult(first = true) }
     }
@@ -627,6 +799,7 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
     private fun checkSendResult(first: Boolean) {
         if (!isOperationActive()) return
         if (!ensureTargetForeground()) return
+        markStage(CycleFailureStage.VERIFY)
         val target = targetForRound
         val screen = ScreenUtils.realSize(service)
         val root = NodeTools.targetRoot(service, target)
@@ -672,12 +845,26 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
 
     private fun onRoundSuccess(reason: String) {
         val outgoing = activeOutgoing ?: return
-        val wasTrial = currentRoundIsTrial && trialRunning
+        val origin = cycleOrigin
+        val result = CycleResult(
+            success = true,
+            failureStage = CycleFailureStage.NONE,
+            error = null,
+            banSuspected = currentCycleBanSuspected,
+            timings = buildCycleTimings(),
+            content = outgoing.fullText
+        )
         roundActive = false
-        currentRoundIsTrial = false
         nextRoundAtElapsed = 0L
         activeOutgoing = null
         cancelPendingCallbacks()
+
+        if (origin == CycleOrigin.SINGLE_SHOT) {
+            finishSingleShotCycle(result)
+            return
+        }
+
+        val wasTrial = origin == CycleOrigin.TRIAL
         sentCount++
         failureCount = 0
         MessageProvider.advanceAfterSuccess(outgoing.settings)
@@ -690,6 +877,7 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
         )
         if (wasTrial) {
             trialRunning = false
+            cycleOrigin = CycleOrigin.MAIN_LOOP
             phase = trialRestorePhase
             statusMessage = "试跑成功 · 已发送 $sentCount 条"
             toast("试跑成功，已发送 $sentCount 条")
@@ -702,16 +890,37 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
     }
 
     private fun failRound(reason: String) {
-        val wasTrial = currentRoundIsTrial && trialRunning
+        val origin = cycleOrigin
+        val stage = if (currentCycleStage == CycleFailureStage.NONE) {
+            CycleFailureStage.LOCATE_INPUT
+        } else {
+            currentCycleStage
+        }
+        val result = CycleResult(
+            success = false,
+            failureStage = stage,
+            error = reason,
+            banSuspected = currentCycleBanSuspected,
+            timings = buildCycleTimings(),
+            content = activeOutgoing?.fullText ?: cycleContentSnapshot
+        )
+        val wasTrial = origin == CycleOrigin.TRIAL
         cancelPendingCallbacks()
         roundActive = false
-        currentRoundIsTrial = false
         activeOutgoing = null
         nextRoundAtElapsed = 0L
+
+        if (origin == CycleOrigin.SINGLE_SHOT) {
+            singleShotRunning = false
+            finishSingleShotCycle(result)
+            return
+        }
+
         LogStore.add("轮次", "❌ 第${roundSequence}轮失败：$reason")
 
         if (wasTrial) {
             trialRunning = false
+            cycleOrigin = CycleOrigin.MAIN_LOOP
             phase = trialRestorePhase
             statusMessage = "试跑失败：$reason"
             toast("试跑失败：$reason")
@@ -738,16 +947,181 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
         }
     }
 
+    private fun finishSingleShotCycle(result: CycleResult) {
+        singleShotRunning = false
+        roundActive = false
+        nextRoundAtElapsed = 0L
+        activeOutgoing = null
+        cycleOrigin = CycleOrigin.MAIN_LOOP
+        phase = singleShotRestorePhase
+        statusMessage = singleShotRestoreStatus.ifBlank {
+            if (phase == Phase.PAUSED) "已暂停，计数保留" else "未开始"
+        }
+        lastSingleShotResult = result
+        lastSingleShotResultAtElapsed = SystemClock.elapsedRealtime()
+        logSingleShotResult(result)
+        notifyChanged()
+    }
+
+    private fun finishSingleShotInterrupted(reason: String) {
+        val stage = if (currentCycleStage == CycleFailureStage.NONE) {
+            CycleFailureStage.LOCATE_INPUT
+        } else {
+            currentCycleStage
+        }
+        val result = CycleResult(
+            success = false,
+            failureStage = stage,
+            error = reason,
+            banSuspected = currentCycleBanSuspected,
+            timings = buildCycleTimings(),
+            content = activeOutgoing?.fullText ?: cycleContentSnapshot
+        )
+        cancelPendingCallbacks()
+        singleShotRunning = false
+        roundActive = false
+        activeOutgoing = null
+        nextRoundAtElapsed = 0L
+        cycleOrigin = CycleOrigin.MAIN_LOOP
+        phase = singleShotRestorePhase
+        statusMessage = "补发中断：$reason"
+        lastSingleShotResult = result
+        lastSingleShotResultAtElapsed = SystemClock.elapsedRealtime()
+        logSingleShotResult(result)
+        toast("已离开抖音，补发中断")
+        notifyChanged()
+    }
+
+    private fun markStage(stage: CycleFailureStage) {
+        val now = SystemClock.elapsedRealtime()
+        when (stage) {
+            CycleFailureStage.INPUT_TEXT -> {
+                if (inputStartedAtElapsed == 0L) inputStartedAtElapsed = now
+            }
+            CycleFailureStage.CLICK_SEND -> {
+                if (sendStartedAtElapsed == 0L) sendStartedAtElapsed = now
+            }
+            CycleFailureStage.VERIFY -> {
+                if (verifyStartedAtElapsed == 0L) verifyStartedAtElapsed = now
+            }
+            else -> Unit
+        }
+        currentCycleStage = stage
+    }
+
+    private fun markLocateFinished() {
+        if (locateFinishedAtElapsed == 0L) {
+            locateFinishedAtElapsed = SystemClock.elapsedRealtime()
+        }
+    }
+
+    private fun markInputFinished() {
+        if (inputFinishedAtElapsed == 0L) {
+            inputFinishedAtElapsed = SystemClock.elapsedRealtime()
+        }
+    }
+
+    private fun markSendFinished() {
+        val now = SystemClock.elapsedRealtime()
+        if (sendFinishedAtElapsed == 0L) sendFinishedAtElapsed = now
+        if (verifyStartedAtElapsed == 0L) verifyStartedAtElapsed = now
+        currentCycleStage = CycleFailureStage.VERIFY
+    }
+
+    private fun buildCycleTimings(): CycleTimings {
+        val now = SystemClock.elapsedRealtime()
+        if (cycleStartedAtElapsed <= 0L) {
+            return CycleTimings(0L, 0L, 0L, 0L, 0L)
+        }
+        val locateEnd = when {
+            locateFinishedAtElapsed > 0L -> locateFinishedAtElapsed
+            currentCycleStage == CycleFailureStage.LOCATE_INPUT -> now
+            inputStartedAtElapsed > 0L -> inputStartedAtElapsed
+            else -> now
+        }
+        val locateMs = (locateEnd - cycleStartedAtElapsed).coerceAtLeast(0L)
+        val inputEnd = when {
+            inputFinishedAtElapsed > 0L -> inputFinishedAtElapsed
+            inputStartedAtElapsed > 0L -> now
+            else -> 0L
+        }
+        val inputMs = if (inputStartedAtElapsed > 0L) {
+            (inputEnd - inputStartedAtElapsed).coerceAtLeast(0L)
+        } else {
+            0L
+        }
+        val sendEnd = when {
+            sendFinishedAtElapsed > 0L -> sendFinishedAtElapsed
+            sendStartedAtElapsed > 0L -> now
+            else -> 0L
+        }
+        val sendMs = if (sendStartedAtElapsed > 0L) {
+            (sendEnd - sendStartedAtElapsed).coerceAtLeast(0L)
+        } else {
+            0L
+        }
+        val verifyMs = if (verifyStartedAtElapsed > 0L) {
+            (now - verifyStartedAtElapsed).coerceAtLeast(0L)
+        } else {
+            0L
+        }
+        val totalMs = (now - cycleStartedAtElapsed).coerceAtLeast(0L)
+        return CycleTimings(
+            locateMs = locateMs,
+            inputMs = inputMs,
+            sendMs = sendMs,
+            verifyMs = verifyMs,
+            totalMs = totalMs
+        )
+    }
+
+    private fun singleShotResultHeadline(result: CycleResult): String {
+        return when {
+            result.success -> service.getString(R.string.single_shot_result_sent)
+            result.failureStage == CycleFailureStage.LOCATE_INPUT ->
+                service.getString(R.string.single_shot_result_no_input)
+            result.failureStage == CycleFailureStage.INPUT_TEXT ->
+                service.getString(R.string.single_shot_result_text_failed)
+            else -> service.getString(R.string.single_shot_result_button_disabled)
+        }
+    }
+
+    private fun cycleStageLabel(stage: CycleFailureStage): String {
+        return when (stage) {
+            CycleFailureStage.NONE -> "无"
+            CycleFailureStage.LOCATE_INPUT -> "LOCATE_INPUT(定位输入框)"
+            CycleFailureStage.INPUT_TEXT -> "INPUT_TEXT(输入文字)"
+            CycleFailureStage.CLICK_SEND -> "CLICK_SEND(点击发送)"
+            CycleFailureStage.VERIFY -> "VERIFY(发送结果校验)"
+        }
+    }
+
+    private fun logSingleShotResult(result: CycleResult) {
+        val timings = result.timings
+        LogStore.add(
+            "补发",
+            "结果=${singleShotResultHeadline(result)}；原文=\"${result.content}\"；" +
+                "耗时 定位=${timings.locateMs}ms 输入=${timings.inputMs}ms 发送=${timings.sendMs}ms " +
+                "校验=${timings.verifyMs}ms 总计=${timings.totalMs}ms；" +
+                "失败阶段=${cycleStageLabel(result.failureStage)}；" +
+                "失败原因=${result.error ?: "无"}；疑似禁言=${result.banSuspected}"
+        )
+    }
+
     private fun handleWrongForeground(activePackage: String) {
         if (destroyed) return
         val target = targetForRound.ifEmpty { AppConfig.load(service).targetPackage }
         if (activePackage == target) return
+        if (singleShotRunning) {
+            finishSingleShotInterrupted("已离开抖音")
+            return
+        }
         if (trialRunning) {
             cancelPendingCallbacks()
             roundActive = false
             activeOutgoing = null
             trialRunning = false
-            currentRoundIsTrial = false
+            cycleOrigin = CycleOrigin.MAIN_LOOP
             phase = Phase.PAUSED
             statusMessage = "试跑已中断：已离开抖音"
             LogStore.add("状态", "检测到前台 ${activePackage}，试跑中断并暂停")
@@ -772,7 +1146,7 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
         roundActive = false
         activeOutgoing = null
         trialRunning = false
-        currentRoundIsTrial = false
+        cycleOrigin = CycleOrigin.MAIN_LOOP
         phase = Phase.PAUSED
         statusMessage = "试跑中断：$reason"
         LogStore.add("试跑", reason)
@@ -805,10 +1179,10 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
 
     private fun isOperationActive(): Boolean {
         if (destroyed || !roundActive) return false
-        return if (currentRoundIsTrial) {
-            trialRunning
-        } else {
-            phase == Phase.RUNNING
+        return when (cycleOrigin) {
+            CycleOrigin.TRIAL -> trialRunning
+            CycleOrigin.SINGLE_SHOT -> singleShotRunning
+            CycleOrigin.MAIN_LOOP -> phase == Phase.RUNNING
         }
     }
 

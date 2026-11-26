@@ -17,7 +17,8 @@ data class Settings(
     val inputX: Float,
     val inputY: Float,
     val sendX: Float,
-    val sendY: Float
+    val sendY: Float,
+    val singleShotText: String
 ) {
     val hasCalibration: Boolean
         get() = inputX in 0f..1f && inputY in 0f..1f && sendX in 0f..1f && sendY in 0f..1f
@@ -26,6 +27,7 @@ data class Settings(
 object AppConfig {
     const val DEFAULT_TARGET_PACKAGE = "com.ss.android.ugc.aweme"
     const val DEFAULT_MESSAGES = "主播唱得真好听\n来了来了，支持一下\n讲得真好，学到了"
+    const val DEFAULT_SINGLE_SHOT_TEXT = "怎么回事？发不了了"
 
     private const val PREFS = "dyshuaping_prefs"
     private const val KEY_MESSAGES = "messages"
@@ -42,6 +44,7 @@ object AppConfig {
     private const val KEY_INPUT_Y = "calib_input_y"
     private const val KEY_SEND_X = "calib_send_x"
     private const val KEY_SEND_Y = "calib_send_y"
+    private const val KEY_SINGLE_SHOT_TEXT = "single_shot_text"
 
     fun prefs(context: Context): SharedPreferences =
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -79,12 +82,20 @@ object AppConfig {
             inputX = p.getFloat(KEY_INPUT_X, -1f),
             inputY = p.getFloat(KEY_INPUT_Y, -1f),
             sendX = p.getFloat(KEY_SEND_X, -1f),
-            sendY = p.getFloat(KEY_SEND_Y, -1f)
+            sendY = p.getFloat(KEY_SEND_Y, -1f),
+            singleShotText = p.getString(KEY_SINGLE_SHOT_TEXT, DEFAULT_SINGLE_SHOT_TEXT)
+                ?.trim()
+                .orEmpty()
+                .ifEmpty { DEFAULT_SINGLE_SHOT_TEXT }
         )
     }
 
     fun saveMessages(context: Context, messages: String) {
         edit(context) { putString(KEY_MESSAGES, messages) }
+    }
+
+    fun saveSingleShotText(context: Context, text: String) {
+        edit(context) { putString(KEY_SINGLE_SHOT_TEXT, text.trim()) }
     }
 
     fun saveRandomMode(context: Context, randomMode: Boolean) {
