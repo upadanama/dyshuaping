@@ -666,7 +666,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
-                android:text="实际间隔 2.0 ~ 5.0 秒（抖动已关闭）"
+                android:text="实际间隔 0.0 ~ 0.0 秒（抖动已关闭）"
                 android:textColor="@color/cyan"
                 android:textSize="12sp"
                 android:textStyle="bold" />
@@ -907,7 +907,7 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="12dp"
             android:gravity="center"
-            android:text="v1.2.0 · debug · 仅本人自用"
+            android:text="v1.4.0 · debug · 仅本人自用"
             android:textColor="@color/text_muted"
             android:textSize="10sp" />
     </LinearLayout>

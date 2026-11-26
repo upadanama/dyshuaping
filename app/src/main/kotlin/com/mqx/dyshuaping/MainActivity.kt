@@ -440,8 +440,8 @@ class MainActivity : Activity() {
             updateTimingPreview(saved.intervalMinTenths, saved.intervalMaxTenths)
             return
         }
-        var min = minRaw.coerceIn(1, 600)
-        var max = maxRaw.coerceIn(1, 600)
+        var min = minRaw.coerceIn(0, 600)
+        var max = maxRaw.coerceIn(0, 600)
         if (min > max) max = min
         updateTimingPreview(min, max)
     }
@@ -493,8 +493,8 @@ class MainActivity : Activity() {
 
         var rangeCorrected = false
         var boundsCorrected = false
-        var min = minRaw.coerceIn(1, 600)
-        var max = maxRaw.coerceIn(1, 600)
+        var min = minRaw.coerceIn(0, 600)
+        var max = maxRaw.coerceIn(0, 600)
         if (min != minRaw || max != maxRaw) {
             rangeCorrected = true
         }
@@ -733,20 +733,25 @@ class MainActivity : Activity() {
     }
 
     private fun startCalibrationFromMain() {
-        if (!isOverlayGranted()) {
-            toast(getString(R.string.overlay_permission_needed))
-            openOverlaySettings()
-            return
-        }
         val service = AutomationAccessibilityService.instance
-        if (service == null) {
-            toast("请先开启无障碍服务，并进入抖音直播间后从悬浮窗点「校准坐标」")
+        // Pause any running loop and hide the floating panel before opening the
+        // fully transparent calibration page. Accessibility can be off: the page
+        // still records coordinates and only skips gesture replay.
+        service?.engine?.pause()
+        service?.onCalibrationActivityOpened()
+        if (!CalibrationActivity.launch(this)) {
+            if (service != null && !service.hasOverlay()) service.ensureOverlay()
+            toast("无法打开校准页面，请重试")
             return
         }
-        // The calibration Activity is launched from the overlay while the live room
-        // is foreground. From this page the target is not foreground, so it will
-        // normally reject the request and show the guided toast.
-        service.startCalibration()
+        if (service == null) {
+            toast("请先开启无障碍服务；当前只能记录坐标，无法回放点击")
+        }
+        toast("透明校准页已打开：先点评论输入框，再点发送按钮")
+        // The calibration Activity lives in its own task. Move the settings task
+        // behind it so the app underneath (normally the Douyin live room) is what
+        // the transparent page and its replayed taps operate on.
+        uiHandler.postDelayed({ moveTaskToBack(true) }, 250L)
     }
 
     private fun handleNotificationPermissionClick() {

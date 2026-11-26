@@ -3,35 +3,41 @@ package com.mqx.dyshuaping
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
-import android.content.res.Configuration
-import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.Paint
-import android.graphics.Point
-import android.graphics.Typeface
+import android.graphics.PixelFormat
 import android.graphics.drawable.ColorDrawable
-import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
-import android.util.TypedValue
-import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
 import android.widget.FrameLayout
-import android.widget.LinearLayout
-import android.widget.TextView
 import android.widget.Toast
-import androidx.core.content.ContextCompat
+import java.util.Locale
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
+/**
+ * v1.4 calibration screen: a completely transparent, immersive page whose only
+ * job is to catch two taps and replay each of them into the app underneath.
+ *
+ * There is deliberately no scrim, crosshair, panel, button or text view. The
+ * only view is an empty transparent FrameLayout that gives the window a content
+ * root; all user guidance is delivered through Toast.
+ */
 class CalibrationActivity : Activity() {
     companion object {
+        private const val TAP_COMMIT_DELAY_MS = 350L
+        private const val DOUBLE_TAP_WINDOW_MS = 300L
+        private const val REPLAY_DEBOUNCE_MS = 500L
+        private const val TOUCH_RESTORE_DELAY_MS = 400L
+        private const val DOUBLE_TAP_SLOP_DP = 48f
+
         @Volatile
         private var running = false
 
@@ -55,34 +61,24 @@ class CalibrationActivity : Activity() {
         }
     }
 
-    private enum class ActiveTarget { INPUT, SEND }
-
-    private data class CalPoint(var x: Int, var y: Int)
-
     private val uiHandler = Handler(Looper.getMainLooper())
-    private lateinit var canvasView: CalibrationCanvasView
-    private lateinit var coordsText: TextView
-    private lateinit var inputTab: TextView
-    private lateinit var sendTab: TextView
-    private lateinit var testButton: TextView
-    private var inputPoint = CalPoint(0, 0)
-    private var sendPoint = CalPoint(0, 0)
-    private var activeTarget = ActiveTarget.INPUT
-    private var screenWidth = 0
-    private var screenHeight = 0
-    private var testAvailable = false
-    private var testReadyAt = 0L
+
+    private var screenWidth = 1
+    private var screenHeight = 1
+    private var inputPoint: android.graphics.Point? = null
+    private var sendPoint: android.graphics.Point? = null
+
+    private var pendingCommit: Runnable? = null
+    private var lastTapUpAtElapsed = 0L
+    private var lastTapX = 0f
+    private var lastTapY = 0f
+    private var downRawX = 0f
+    private var downRawY = 0f
+    private var downAtElapsed = 0L
+    private var lastForwardAtElapsed = 0L
     private var finishing = false
 
-    private val testButtonReset = Runnable {
-        if (!finishing) {
-            testButton.isEnabled = testAvailable
-            testButton.isClickable = testAvailable
-            testButton.alpha = if (testAvailable) 1f else 0.5f
-        }
-    }
-
-    private val testTouchableReset = Runnable {
+    private val restoreTouchable = Runnable {
         if (!finishing) {
             try {
                 window.clearFlags(WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE)
@@ -98,23 +94,199 @@ class CalibrationActivity : Activity() {
         val real = ScreenUtils.realSize(this)
         screenWidth = real.x.coerceAtLeast(1)
         screenHeight = real.y.coerceAtLeast(1)
-        loadPoints()
-        testAvailable = AutomationAccessibilityService.instance?.canTestCalibrationClick() == true
-        setContentView(buildUi())
+
+        // The page must remain visually empty; the transparent root only supplies
+        // the window's content surface. Touch handling happens in dispatchTouchEvent.
+        setContentView(FrameLayout(this).apply { setBackgroundColor(Color.TRANSPARENT) })
         applyImmersiveMode()
-        updateUi()
-        AutomationAccessibilityService.instance?.onCalibrationActivityOpened()
+
+        val service = AutomationAccessibilityService.instance
+        // The entry points (MainActivity and the floating calibration button)
+        // pause the engine before launching; this page only needs to clear any
+        // floating window that could intercept touches.
+        service?.onCalibrationActivityOpened()
+
         try {
             @Suppress("DEPRECATION")
             overridePendingTransition(0, 0)
         } catch (_: Throwable) {
         }
-        LogStore.add("校准", "校准界面已打开，屏幕=${screenWidth}x$screenHeight")
+        toast("校准：先点评论输入框，再点发送按钮；双击撤销，返回取消")
+        LogStore.add("校准", "透明校准页已打开，屏幕=${screenWidth}x$screenHeight")
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) applyImmersiveMode()
+    }
+
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        if (event.pointerCount > 1) return true
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                downRawX = event.rawX
+                downRawY = event.rawY
+                downAtElapsed = SystemClock.elapsedRealtime()
+            }
+            MotionEvent.ACTION_UP -> {
+                val dx = event.rawX - downRawX
+                val dy = event.rawY - downRawY
+                val moved = dx * dx + dy * dy
+                val elapsed = SystemClock.elapsedRealtime() - downAtElapsed
+                if (moved <= dp(24f) * dp(24f) && elapsed <= 1500L) {
+                    onTransparentTap(event.rawX, event.rawY)
+                }
+            }
+            MotionEvent.ACTION_CANCEL -> Unit
+        }
+        return true
+    }
+
+    private fun onTransparentTap(rawX: Float, rawY: Float) {
+        if (finishing) return
+        val now = SystemClock.elapsedRealtime()
+        // A replayed gesture must never be captured back by the transparent layer
+        // as a new calibration tap. This 500ms guard swallows both the physical
+        // bounce and any late synthetic event; the window itself is also marked
+        // non-touchable for the first 400ms.
+        if (lastForwardAtElapsed > 0L && now - lastForwardAtElapsed < REPLAY_DEBOUNCE_MS) {
+            LogStore.add("校准", "500ms 防抖忽略触摸 (${rawX.toInt()},${rawY.toInt()})")
+            return
+        }
+        val x = rawX.roundToInt().coerceIn(0, screenWidth - 1)
+        val y = rawY.roundToInt().coerceIn(0, screenHeight - 1)
+        val closeToLast = abs(rawX - lastTapX) <= dp(DOUBLE_TAP_SLOP_DP) &&
+            abs(rawY - lastTapY) <= dp(DOUBLE_TAP_SLOP_DP)
+        val isDoubleTap = now - lastTapUpAtElapsed in 1L..DOUBLE_TAP_WINDOW_MS &&
+            closeToLast &&
+            pendingCommit != null
+
+        lastTapUpAtElapsed = now
+        lastTapX = rawX
+        lastTapY = rawY
+
+        if (isDoubleTap) {
+            pendingCommit?.let { uiHandler.removeCallbacks(it) }
+            pendingCommit = null
+            // Avoid a triple tap being interpreted as another double tap.
+            lastTapUpAtElapsed = 0L
+            undoLastPoint()
+            return
+        }
+
+        lateinit var commit: Runnable
+        commit = Runnable {
+            if (pendingCommit === commit) pendingCommit = null
+            commitPoint(x, y)
+        }
+        pendingCommit = commit
+        uiHandler.postDelayed(commit, TAP_COMMIT_DELAY_MS)
+    }
+
+    private fun commitPoint(x: Int, y: Int) {
+        if (finishing) return
+        if (inputPoint == null) {
+            inputPoint = android.graphics.Point(x, y)
+            LogStore.add("校准", "记录评论输入框坐标=($x,$y)")
+            forwardTap(x, y)
+            toast("已记录评论输入框，请点击发送按钮")
+            return
+        }
+        if (sendPoint == null) {
+            sendPoint = android.graphics.Point(x, y)
+            val input = inputPoint ?: return
+            val inputX = normalize(input.x, screenWidth)
+            val inputY = normalize(input.y, screenHeight)
+            val sendX = normalize(x, screenWidth)
+            val sendY = normalize(y, screenHeight)
+            AppConfig.saveCalibration(this, inputX, inputY, sendX, sendY)
+            LogStore.add(
+                "校准",
+                "校准已保存：输入框=(${format(inputX)},${format(inputY)}) " +
+                    "发送按钮=(${format(sendX)},${format(sendY)})，屏幕=${screenWidth}x$screenHeight"
+            )
+            forwardTap(x, y)
+            toast(
+                String.format(
+                    Locale.US,
+                    "校准已保存：输入 (%.4f, %.4f)，发送 (%.4f, %.4f)",
+                    inputX,
+                    inputY,
+                    sendX,
+                    sendY
+                )
+            )
+            finishing = true
+            uiHandler.postDelayed({ if (!isFinishing) finish() }, 80L)
+        }
+    }
+
+    private fun undoLastPoint() {
+        when {
+            sendPoint != null -> {
+                sendPoint = null
+                toast("已撤销发送按钮点，请重新点击")
+                LogStore.add("校准", "双击撤销发送按钮点")
+            }
+            inputPoint != null -> {
+                inputPoint = null
+                toast("已撤销评论输入框点，请重新点击")
+                LogStore.add("校准", "双击撤销评论输入框点")
+            }
+            else -> {
+                toast("没有可撤销的点")
+            }
+        }
+    }
+
+    /**
+     * Replay the same physical tap into the app below. The transparent window is
+     * temporarily made non-touchable so the injected click is delivered below.
+     */
+    private fun forwardTap(x: Int, y: Int) {
+        val service = AutomationAccessibilityService.instance
+        if (service == null) {
+            toast("请先开启无障碍服务")
+            LogStore.add("校准", "无障碍服务未开启，只记录坐标 ($x,$y)，不回放")
+            return
+        }
+        val now = SystemClock.elapsedRealtime()
+        // The 500ms debounce is enforced when touches are received, before a
+        // coordinate is recorded. Once a point is recorded here, it must replay.
+        lastForwardAtElapsed = now
+        try {
+            window.addFlags(WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE)
+        } catch (_: Throwable) {
+        }
+        // Let the window-manager flag land before injecting the synthetic touch,
+        // so the gesture goes to the app below rather than this transparent layer.
+        uiHandler.postDelayed({
+            val accepted = service.dispatchCalibrationTap(x, y)
+            LogStore.add("校准", "透明层回放点击 ($x,$y) accepted=$accepted")
+            uiHandler.removeCallbacks(restoreTouchable)
+            uiHandler.postDelayed(restoreTouchable, TOUCH_RESTORE_DELAY_MS)
+        }, 24L)
+    }
+
+    private fun normalize(value: Int, fullSize: Int): Float {
+        if (fullSize <= 0) return 0f
+        return (value.toFloat() / fullSize.toFloat()).coerceIn(0f, 1f)
+    }
+
+    private fun format(value: Float): String = String.format(Locale.US, "%.4f", value)
+
+    private fun dp(value: Float): Int =
+        (value * resources.displayMetrics.density).roundToInt()
+
+    @Suppress("DEPRECATION")
+    override fun onBackPressed() {
+        if (!finishing) {
+            finishing = true
+            uiHandler.removeCallbacksAndMessages(null)
+            toast("已取消校准，未保存")
+            LogStore.add("校准", "返回键取消校准，未保存")
+        }
+        super.onBackPressed()
     }
 
     override fun onDestroy() {
@@ -136,6 +308,8 @@ class CalibrationActivity : Activity() {
                 WindowManager.LayoutParams.FLAG_FULLSCREEN or
                 WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
         )
+        window.clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+        window.setFormat(PixelFormat.TRANSLUCENT)
         window.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
         window.statusBarColor = Color.TRANSPARENT
         window.navigationBarColor = Color.TRANSPARENT
@@ -168,500 +342,10 @@ class CalibrationActivity : Activity() {
         }
     }
 
-    private fun loadPoints() {
-        val settings = AppConfig.load(this)
-        if (settings.hasCalibration) {
-            inputPoint = CalPoint(
-                ScreenUtils.normalizedToPx(settings.inputX, screenWidth),
-                ScreenUtils.normalizedToPx(settings.inputY, screenHeight)
-            )
-            sendPoint = CalPoint(
-                ScreenUtils.normalizedToPx(settings.sendX, screenWidth),
-                ScreenUtils.normalizedToPx(settings.sendY, screenHeight)
-            )
-        } else {
-            inputPoint = CalPoint(
-                (screenWidth * 0.45f).roundToInt(),
-                (screenHeight * 0.84f).roundToInt()
-            )
-            sendPoint = CalPoint(
-                (screenWidth * 0.92f).roundToInt(),
-                (screenHeight * 0.84f).roundToInt()
-            )
-        }
-        clampPoint(inputPoint)
-        clampPoint(sendPoint)
-    }
-
-    private fun buildUi(): View {
-        val root = FrameLayout(this).apply {
-            setBackgroundColor(Color.TRANSPARENT)
-        }
-        canvasView = CalibrationCanvasView(this)
-        root.addView(
-            canvasView,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT
-            )
-        )
-
-        val topCard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(14f), dp(12f), dp(14f), dp(12f))
-            background = panelDrawable()
-        }
-        topCard.addView(
-            label("校准评论位置", 15f, ContextCompat.getColor(this, R.color.text), bold = true)
-        )
-        topCard.addView(
-            label(
-                "手指点哪儿，当前准星就移到哪儿；可拖到屏幕边缘，也可用下方微调。",
-                11f,
-                ContextCompat.getColor(this, R.color.text_dim)
-            ),
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(4f) }
-        )
-
-        val tabs = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-        }
-        inputTab = targetTab("输入框", ContextCompat.getColor(this, R.color.cyan))
-        sendTab = targetTab("发送按钮", ContextCompat.getColor(this, R.color.accent))
-        inputTab.setOnClickListener {
-            activeTarget = ActiveTarget.INPUT
-            updateUi()
-        }
-        sendTab.setOnClickListener {
-            activeTarget = ActiveTarget.SEND
-            updateUi()
-        }
-        tabs.addView(
-            inputTab,
-            LinearLayout.LayoutParams(0, dp(42f), 1f)
-        )
-        tabs.addView(
-            sendTab,
-            LinearLayout.LayoutParams(0, dp(42f), 1f).apply { marginStart = dp(8f) }
-        )
-        topCard.addView(
-            tabs,
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(8f) }
-        )
-
-        coordsText = label("", 11f, ContextCompat.getColor(this, R.color.text_dim)).apply {
-            typeface = Typeface.MONOSPACE
-            setPadding(0, dp(5f), 0, 0)
-        }
-        topCard.addView(
-            coordsText,
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            )
-        )
-
-        val actions = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-        }
-        val cancel = actionButton(
-            "取消",
-            R.drawable.bg_button_ghost,
-            ContextCompat.getColor(this, R.color.text_dim)
-        )
-        cancel.setOnClickListener {
-            toast("已取消校准")
-            finish()
-        }
-        val save = actionButton(
-            "保存校准",
-            R.drawable.bg_button_primary,
-            Color.WHITE
-        )
-        save.setOnClickListener { saveAndFinish() }
-        actions.addView(cancel, LinearLayout.LayoutParams(0, dp(44f), 1f))
-        actions.addView(
-            save,
-            LinearLayout.LayoutParams(0, dp(44f), 1f).apply { marginStart = dp(8f) }
-        )
-        topCard.addView(
-            actions,
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(8f) }
-        )
-
-        root.addView(
-            topCard,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                gravity = Gravity.TOP
-                leftMargin = dp(12f)
-                rightMargin = dp(12f)
-                topMargin = dp(16f)
-            }
-        )
-
-        val bottomBar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(10f), dp(9f), dp(10f), dp(9f))
-            background = panelDrawable(Color.parseColor("#C0171920"))
-        }
-        val up = directionButton("上")
-        val down = directionButton("下")
-        val left = directionButton("左")
-        val right = directionButton("右")
-        installRepeat(up, 0, -1)
-        installRepeat(down, 0, 1)
-        installRepeat(left, -1, 0)
-        installRepeat(right, 1, 0)
-        bottomBar.addView(up, LinearLayout.LayoutParams(0, dp(44f), 1f))
-        bottomBar.addView(down, LinearLayout.LayoutParams(0, dp(44f), 1f).apply { marginStart = dp(6f) })
-        bottomBar.addView(left, LinearLayout.LayoutParams(0, dp(44f), 1f).apply { marginStart = dp(6f) })
-        bottomBar.addView(right, LinearLayout.LayoutParams(0, dp(44f), 1f).apply { marginStart = dp(6f) })
-        testButton = actionButton(
-            "测试点击",
-            R.drawable.bg_button_ghost,
-            ContextCompat.getColor(this, R.color.cyan)
-        ).apply {
-            setOnClickListener { performTestClick() }
-        }
-        bottomBar.addView(testButton, LinearLayout.LayoutParams(0, dp(44f), 1.5f).apply {
-            marginStart = dp(6f)
-        })
-        root.addView(
-            bottomBar,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                gravity = Gravity.BOTTOM
-                leftMargin = dp(12f)
-                rightMargin = dp(12f)
-                bottomMargin = dp(14f)
-            }
-        )
-
-        return root
-    }
-
-    private fun updateUi() {
-        if (!::coordsText.isInitialized) return
-        val active = activePoint()
-        coordsText.text =
-            "当前：${if (activeTarget == ActiveTarget.INPUT) "输入框" else "发送按钮"} " +
-                "(${active.x}, ${active.y})    " +
-                "输入框 (${inputPoint.x}, ${inputPoint.y})  ·  发送 (${sendPoint.x}, ${sendPoint.y})"
-        inputTab.background = chipDrawable(
-            activeTarget == ActiveTarget.INPUT,
-            ContextCompat.getColor(this, R.color.cyan)
-        )
-        inputTab.setTextColor(
-            ContextCompat.getColor(
-                this,
-                if (activeTarget == ActiveTarget.INPUT) R.color.cyan else R.color.text_dim
-            )
-        )
-        sendTab.background = chipDrawable(
-            activeTarget == ActiveTarget.SEND,
-            ContextCompat.getColor(this, R.color.accent)
-        )
-        sendTab.setTextColor(
-            ContextCompat.getColor(
-                this,
-                if (activeTarget == ActiveTarget.SEND) R.color.accent else R.color.text_dim
-            )
-        )
-        val testCoolingDown = SystemClock.elapsedRealtime() < testReadyAt
-        val canTest = testAvailable && !testCoolingDown
-        testButton.isEnabled = canTest
-        testButton.isClickable = canTest
-        testButton.alpha = if (canTest) 1f else 0.45f
-        canvasView.invalidate()
-    }
-
-    private fun activePoint(): CalPoint =
-        if (activeTarget == ActiveTarget.INPUT) inputPoint else sendPoint
-
-    private fun moveActive(x: Int, y: Int) {
-        val point = activePoint()
-        point.x = x.coerceIn(0, screenWidth - 1)
-        point.y = y.coerceIn(0, screenHeight - 1)
-        updateUi()
-    }
-
-    private fun moveActiveBy(dx: Int, dy: Int) {
-        val point = activePoint()
-        moveActive(point.x + dx, point.y + dy)
-    }
-
-    private fun performTestClick() {
-        val now = SystemClock.elapsedRealtime()
-        if (now < testReadyAt) return
-        if (!testAvailable) {
-            toast("无障碍服务未连接，测试点击不可用")
-            return
-        }
-        val service = AutomationAccessibilityService.instance
-        if (service == null || !service.canTestCalibrationClick()) {
-            testAvailable = false
-            updateUi()
-            toast("无障碍服务未连接，测试点击不可用")
-            return
-        }
-        val point = activePoint()
-        testReadyAt = now + 1000L
-        testButton.isEnabled = false
-        testButton.isClickable = false
-        testButton.alpha = 0.45f
-        uiHandler.postDelayed(testButtonReset, 1000L)
-
-        try {
-            window.addFlags(WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE)
-        } catch (_: Throwable) {
-        }
-        uiHandler.postDelayed({
-            if (!finishing) {
-                val ok = service.dispatchCalibrationTestClick(point.x, point.y)
-                toast(if (ok) "测试点击已发送" else "测试点击失败")
-            }
-            uiHandler.postDelayed(testTouchableReset, 350L)
-        }, 60L)
-    }
-
-    private fun installRepeat(button: TextView, dx: Int, dy: Int) {
-        button.setOnTouchListener { view, event ->
-            when (event.actionMasked) {
-                MotionEvent.ACTION_DOWN -> {
-                    moveActiveBy(dx, dy)
-                    val repeat = object : Runnable {
-                        override fun run() {
-                            moveActiveBy(dx, dy)
-                            uiHandler.postDelayed(this, 50L)
-                        }
-                    }
-                    view.tag = repeat
-                    uiHandler.postDelayed(repeat, 350L)
-                    true
-                }
-
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    (view.tag as? Runnable)?.let { uiHandler.removeCallbacks(it) }
-                    view.tag = null
-                    if (event.actionMasked == MotionEvent.ACTION_UP) view.performClick()
-                    true
-                }
-
-                else -> false
-            }
-        }
-    }
-
-    private fun saveAndFinish() {
-        if (screenWidth <= 0 || screenHeight <= 0) {
-            toast("无法获取屏幕尺寸，保存失败")
-            return
-        }
-        val inputX = inputPoint.x.toFloat() / screenWidth
-        val inputY = inputPoint.y.toFloat() / screenHeight
-        val sendX = sendPoint.x.toFloat() / screenWidth
-        val sendY = sendPoint.y.toFloat() / screenHeight
-        AppConfig.saveCalibration(this, inputX, inputY, sendX, sendY)
-        LogStore.add(
-            "校准",
-            "保存：屏幕=${screenWidth}x$screenHeight 输入框=(${inputPoint.x},${inputPoint.y}) " +
-                "发送=(${sendPoint.x},${sendPoint.y})"
-        )
-        toast("校准已保存")
-        finish()
-    }
-
-    private fun clampPoint(point: CalPoint) {
-        point.x = point.x.coerceIn(0, screenWidth - 1)
-        point.y = point.y.coerceIn(0, screenHeight - 1)
-    }
-
-    private fun directionButton(textValue: String): TextView {
-        return actionButton(
-            textValue,
-            R.drawable.bg_button_ghost,
-            ContextCompat.getColor(this, R.color.text)
-        )
-    }
-
-    private fun targetTab(textValue: String, color: Int): TextView {
-        return label(textValue, 13f, color, bold = true).apply {
-            gravity = Gravity.CENTER
-            isClickable = true
-            isFocusable = true
-            setPadding(dp(8f), 0, dp(8f), 0)
-            background = chipDrawable(false, color)
-        }
-    }
-
-    private fun label(textValue: String, sizeSp: Float, color: Int, bold: Boolean = false): TextView {
-        return TextView(this).apply {
-            text = textValue
-            setTextColor(color)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, sizeSp)
-            typeface = Typeface.create(
-                if (bold) "sans-serif-medium" else "sans-serif",
-                Typeface.NORMAL
-            )
-        }
-    }
-
-    private fun actionButton(textValue: String, backgroundRes: Int, textColor: Int): TextView {
-        return TextView(this).apply {
-            text = textValue
-            gravity = Gravity.CENTER
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-            setTextColor(textColor)
-            background = ContextCompat.getDrawable(this@CalibrationActivity, backgroundRes)?.mutate()
-            isClickable = true
-            isFocusable = true
-            minHeight = 0
-            setPadding(dp(6f), 0, dp(6f), 0)
-        }
-    }
-
-    private fun panelDrawable(color: Int = Color.parseColor("#F2171920")): GradientDrawable {
-        return GradientDrawable().apply {
-            cornerRadius = dp(16f).toFloat()
-            setColor(color)
-            setStroke(dp(1f), Color.parseColor("#4A5360"))
-        }
-    }
-
-    private fun chipDrawable(selected: Boolean, color: Int): GradientDrawable {
-        return GradientDrawable().apply {
-            cornerRadius = dp(10f).toFloat()
-            if (selected) {
-                setColor(Color.argb(50, Color.red(color), Color.green(color), Color.blue(color)))
-                setStroke(dp(1f), color)
-            } else {
-                setColor(Color.parseColor("#20232B"))
-                setStroke(dp(1f), Color.parseColor("#303542"))
-            }
-        }
-    }
-
-    private fun dp(value: Float): Int =
-        (value * resources.displayMetrics.density).roundToInt()
-
     private fun toast(message: String) {
-        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
-    }
-
-    override fun onConfigurationChanged(newConfig: Configuration) {
-        super.onConfigurationChanged(newConfig)
-        val oldW = screenWidth
-        val oldH = screenHeight
-        val real = ScreenUtils.realSize(this)
-        screenWidth = real.x.coerceAtLeast(1)
-        screenHeight = real.y.coerceAtLeast(1)
-        if (oldW > 0 && oldH > 0) {
-            inputPoint.x = (inputPoint.x.toFloat() / oldW * screenWidth).roundToInt()
-            inputPoint.y = (inputPoint.y.toFloat() / oldH * screenHeight).roundToInt()
-            sendPoint.x = (sendPoint.x.toFloat() / oldW * screenWidth).roundToInt()
-            sendPoint.y = (sendPoint.y.toFloat() / oldH * screenHeight).roundToInt()
-            clampPoint(inputPoint)
-            clampPoint(sendPoint)
-        }
-        updateUi()
-        applyImmersiveMode()
-        window.decorView.post { applyImmersiveMode() }
-    }
-
-    private inner class CalibrationCanvasView(context: Context) : View(context) {
-        private val scrimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(92, 0, 0, 0)
-        }
-        private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE
-            strokeWidth = dp(1f).toFloat()
-            strokeCap = Paint.Cap.ROUND
-        }
-        private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.FILL
-        }
-        private var originX = 0
-        private var originY = 0
-        private val span = dp(10f).toFloat()
-        private val dotRadius = dp(1.5f).toFloat()
-
-        init {
-            isClickable = true
-            isFocusable = true
-            contentDescription = "全屏校准区域，手指点哪里当前准星就去哪里"
-        }
-
-        override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
-            super.onLayout(changed, left, top, right, bottom)
-            val location = IntArray(2)
-            getLocationOnScreen(location)
-            originX = location[0]
-            originY = location[1]
-        }
-
-        override fun onDraw(canvas: Canvas) {
-            super.onDraw(canvas)
-            canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), scrimPaint)
-            val inputColor = ContextCompat.getColor(this@CalibrationActivity, R.color.cyan)
-            val sendColor = ContextCompat.getColor(this@CalibrationActivity, R.color.accent)
-            if (activeTarget == ActiveTarget.INPUT) {
-                drawCross(canvas, sendPoint, sendColor, 80)
-                drawCross(canvas, inputPoint, inputColor, 255)
-            } else {
-                drawCross(canvas, inputPoint, inputColor, 80)
-                drawCross(canvas, sendPoint, sendColor, 255)
-            }
-        }
-
-        private fun drawCross(canvas: Canvas, point: CalPoint, color: Int, alpha: Int) {
-            val cx = (point.x - originX).toFloat()
-            val cy = (point.y - originY).toFloat()
-            val drawColor = Color.argb(
-                alpha.coerceIn(0, 255),
-                Color.red(color),
-                Color.green(color),
-                Color.blue(color)
-            )
-            linePaint.color = drawColor
-            dotPaint.color = drawColor
-            canvas.drawLine(cx - span, cy, cx + span, cy, linePaint)
-            canvas.drawLine(cx, cy - span, cx, cy + span, linePaint)
-            canvas.drawCircle(cx, cy, dotRadius, dotPaint)
-        }
-
-        override fun onTouchEvent(event: MotionEvent): Boolean {
-            when (event.actionMasked) {
-                MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> {
-                    moveActive(event.rawX.roundToInt(), event.rawY.roundToInt())
-                    return true
-                }
-                MotionEvent.ACTION_UP -> {
-                    performClick()
-                    return true
-                }
-                MotionEvent.ACTION_CANCEL -> return true
-            }
-            return super.onTouchEvent(event)
-        }
-
-        override fun performClick(): Boolean {
-            super.performClick()
-            return true
+        try {
+            Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+        } catch (_: Throwable) {
         }
     }
 }

@@ -30,8 +30,8 @@ object AppConfig {
     const val DEFAULT_TARGET_PACKAGE = "com.ss.android.ugc.aweme"
     const val DEFAULT_MESSAGES = "主播唱得真好听\n来了来了，支持一下\n讲得真好，学到了"
     const val DEFAULT_SINGLE_SHOT_TEXT = "怎么回事？发不了了"
-    const val DEFAULT_INTERVAL_MIN_TENTHS = 20
-    const val DEFAULT_INTERVAL_MAX_TENTHS = 50
+    const val DEFAULT_INTERVAL_MIN_TENTHS = 0
+    const val DEFAULT_INTERVAL_MAX_TENTHS = 0
     const val DEFAULT_JITTER_MAX_TENTHS = 5
 
     private const val PREFS = "dyshuaping_prefs"
@@ -103,8 +103,8 @@ object AppConfig {
                 DEFAULT_INTERVAL_MAX_TENTHS
             }
         }
-        minTenths = minTenths.coerceIn(1, 600)
-        maxTenths = maxTenths.coerceIn(1, 600)
+        minTenths = minTenths.coerceIn(0, 600)
+        maxTenths = maxTenths.coerceIn(0, 600)
         if (maxTenths < minTenths) maxTenths = minTenths
         val jitterEnabled = try {
             p.getBoolean(KEY_JITTER_ENABLED, false)
@@ -177,7 +177,7 @@ object AppConfig {
         jitterEnabled: Boolean,
         jitterMaxTenths: Int
     ) {
-        val lo = minTenths.coerceIn(1, 600)
+        val lo = minTenths.coerceIn(0, 600)
         val hi = maxTenths.coerceIn(lo, 600)
         val jitter = jitterMaxTenths.coerceIn(1, 600)
         edit(context) {

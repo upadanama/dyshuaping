@@ -34,7 +34,9 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
         val singleShotRunning: Boolean,
         val singleShotCooldownUntilElapsed: Long,
         val singleShotResult: CycleResult?,
-        val singleShotResultAtElapsed: Long
+        val singleShotResultAtElapsed: Long,
+        val lastRoundDurationMs: Long,
+        val lastRoundPath: String
     )
 
     enum class CycleFailureStage {
@@ -50,6 +52,7 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
         val inputMs: Long,
         val sendMs: Long,
         val verifyMs: Long,
+        val idleMs: Long,
         val totalMs: Long
     )
 
@@ -59,7 +62,8 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
         val error: String?,
         val banSuspected: Boolean,
         val timings: CycleTimings,
-        val content: String
+        val content: String,
+        val path: String
     )
 
     private enum class CycleOrigin {
@@ -121,6 +125,11 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
     private var sendFinishedAtElapsed = 0L
     private var verifyStartedAtElapsed = 0L
     private var cycleContentSnapshot = ""
+    private var currentCycleIdleMs = 0L
+    private var pendingIdleMs = 0L
+    private var currentInputMode = ""
+    private var lastRoundDurationMs = 0L
+    private var lastRoundPath = ""
 
     private var sendDisabledGrace = 0
     private var sendMissingGrace = 0
@@ -140,7 +149,9 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
         singleShotRunning = singleShotRunning,
         singleShotCooldownUntilElapsed = singleShotCooldownUntilElapsed,
         singleShotResult = lastSingleShotResult,
-        singleShotResultAtElapsed = lastSingleShotResultAtElapsed
+        singleShotResultAtElapsed = lastSingleShotResultAtElapsed,
+        lastRoundDurationMs = lastRoundDurationMs,
+        lastRoundPath = lastRoundPath
     )
 
     fun start() {
@@ -197,6 +208,7 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
         val wasTrial = trialRunning
         val wasSingleShot = singleShotRunning
         cancelPendingCallbacks()
+        pendingIdleMs = 0L
         roundActive = false
         nextRoundAtElapsed = 0L
         activeOutgoing = null
@@ -216,6 +228,7 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
     fun stop() {
         if (destroyed) return
         cancelPendingCallbacks()
+        pendingIdleMs = 0L
         phase = Phase.IDLE
         roundActive = false
         trialRunning = false
@@ -262,6 +275,7 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
         }
 
         cancelPendingCallbacks()
+        pendingIdleMs = 0L
         trialRestorePhase = phase
         trialRestoreStatus = statusMessage
         trialRunning = true
@@ -304,6 +318,7 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
 
         val content = settings.singleShotText.ifBlank { AppConfig.DEFAULT_SINGLE_SHOT_TEXT }
         cancelPendingCallbacks()
+        pendingIdleMs = 0L
         singleShotRestorePhase = phase
         singleShotRestoreStatus = statusMessage
         singleShotRunning = true
@@ -374,6 +389,7 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
     private fun scheduleInitialRound(fromResume: Boolean) {
         if (phase != Phase.RUNNING || trialRunning || destroyed) return
         cancelPendingCallbacks()
+        pendingIdleMs = 0L
         nextRoundAtElapsed = 0L
         statusMessage = if (fromResume) "回到抖音，准备继续" else "准备开始"
         notifyChanged()
@@ -409,8 +425,10 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
             "节奏",
             "下一轮等待 ${formatSeconds(delay)} 秒（区间 ${formatSeconds(intervalMinMs)}~${formatSeconds(intervalMaxMs)}秒，$jitterText）"
         )
+        pendingIdleMs = delay
         notifyChanged()
-        later(delay) { beginRound(isTrial = false) }
+        // 0.0 interval must not acquire a minimum delay: schedule with later(0).
+        later(if (delay <= 0L) 0L else delay) { beginRound(isTrial = false) }
     }
 
     private fun beginRound(isTrial: Boolean) {
@@ -484,6 +502,9 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
         sendRefillCount = 0
         currentCycleStage = CycleFailureStage.LOCATE_INPUT
         currentCycleBanSuspected = false
+        currentCycleIdleMs = pendingIdleMs
+        pendingIdleMs = 0L
+        currentInputMode = ""
         cycleStartedAtElapsed = SystemClock.elapsedRealtime()
         locateFinishedAtElapsed = 0L
         inputStartedAtElapsed = 0L
@@ -501,9 +522,9 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
         activeOutgoing = outgoing
 
         statusMessage = if (origin == CycleOrigin.SINGLE_SHOT) {
-            "补发中：定位输入框"
+            "补发中：直填/定位输入框"
         } else {
-            "第${roundNumber}轮：定位输入框"
+            "第${roundNumber}轮：直填/定位输入框"
         }
         val logMessage = when (origin) {
             CycleOrigin.SINGLE_SHOT -> "开始补发一次，内容=\"$fullText\""
@@ -512,44 +533,178 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
         }
         LogStore.add(if (origin == CycleOrigin.SINGLE_SHOT) "补发" else "轮次", logMessage)
         notifyChanged()
-        locateInput(0)
+        attemptDirectFill()
     }
 
-    private fun locateInput(attempt: Int) {
+    /**
+     * v1.4 fast path: write directly into an isEditable node with ACTION_SET_TEXT
+     * (focus + retry only if the first attempt is rejected). On any failure it
+     * falls back to the old click-input path; it never waits for a keyboard here.
+     */
+    private fun attemptDirectFill() {
         if (!isOperationActive()) return
         if (!ensureTargetForeground()) return
+        val outgoing = activeOutgoing ?: return
         val target = targetForRound
         val screen = ScreenUtils.realSize(service)
-        setStatus("定位评论输入框")
+        setStatus("直填评论输入框")
         val root = NodeTools.targetRoot(service, target)
         if (root == null) {
-            LogStore.add("定位", "获取窗口 root 失败（第${attempt + 1}次），500ms 后重试")
-            if (attempt < 2) {
-                later(500L) { locateInput(attempt + 1) }
-            } else {
-                fallbackInput("连续获取窗口失败/未找到输入框")
-            }
+            fallbackToClickInput("直填：获取窗口 root 失败")
             return
         }
-        val hit = NodeTools.findInput(root, target, screen.x, screen.y)
-        if (hit == null) {
-            LogStore.add("定位", "未找到输入框节点（第${attempt + 1}次），500ms 后重试")
-            if (attempt < 2) {
-                later(500L) { locateInput(attempt + 1) }
-            } else {
-                fallbackInput("无障碍定位输入框失败")
-            }
-            return
-        }
-
-        LogStore.add("定位", "找到输入框：${hit.shortDetail()} bounds=${hit.boundsLabel}")
-        if (!clickAt(hit.centerX, hit.centerY, "输入框")) {
-            if (isOperationActive()) failRound("输入框点击未被系统接受")
+        val editable = NodeTools.findEditable(root, target, screen.x, screen.y, requireFocused = false)
+        if (editable == null) {
+            fallbackToClickInput("直填：未找到 isEditable 节点")
             return
         }
         markLocateFinished()
-        setStatus("已点击输入框，等待键盘")
-        later(randomBetween(450, 650).toLong()) { beginTextEntry(1) }
+        markStage(CycleFailureStage.INPUT_TEXT)
+
+        val args = Bundle().apply {
+            putCharSequence(
+                AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                outgoing.fullText
+            )
+        }
+        var setOk = try {
+            editable.node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        } catch (_: Throwable) {
+            false
+        }
+        var focusUsed = false
+        if (!setOk) {
+            focusUsed = true
+            try {
+                editable.node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+            } catch (_: Throwable) {
+            }
+            setOk = try {
+                editable.node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+            } catch (_: Throwable) {
+                false
+            }
+        }
+        if (!setOk) {
+            fallbackToClickInput("直填：ACTION_SET_TEXT 未被接受")
+            return
+        }
+
+        // Verify on a short 20ms poll. Usually the text is already there on the
+        // first check; polling only covers vendor builds that refresh node text a
+        // frame later. Any timeout still falls back to the click-input path.
+        var actual = ""
+        awaitCondition(
+            timeoutMs = 500L,
+            intervalMs = 20L,
+            condition = {
+                val verifyRoot = NodeTools.targetRoot(service, target)
+                val verifyEditable = verifyRoot?.let {
+                    NodeTools.findEditable(it, target, screen.x, screen.y, requireFocused = false)
+                }
+                actual = verifyEditable?.hit?.text.orEmpty()
+                actual.contains(outgoing.fullText)
+            },
+            onResult = { verified ->
+                if (!isOperationActive()) return@awaitCondition
+                LogStore.add(
+                    "输入",
+                    "直填：SET_TEXT=$setOk，focusRetry=$focusUsed，verified=$verified，text=\"${actual.take(80)}\""
+                )
+                if (!verified) {
+                    fallbackToClickInput("直填：写入后校验未通过")
+                    return@awaitCondition
+                }
+                currentInputMode = "直填"
+                markInputFinished()
+                setStatus(
+                    if (cycleOrigin == CycleOrigin.SINGLE_SHOT) {
+                        "补发：直填完成，发送"
+                    } else {
+                        "直填完成，立即发送"
+                    }
+                )
+                LogStore.add("轮次", "本轮输入路径=直填${if (focusUsed) "（聚焦后重试）" else ""}")
+                tapSend()
+            }
+        )
+    }
+
+    private fun fallbackToClickInput(reason: String) {
+        if (!isOperationActive()) return
+        currentInputMode = "点击输入框"
+        LogStore.add("输入", "$reason，回退到点击输入框路径")
+        locateInput()
+    }
+
+    private fun locateInput() {
+        if (!isOperationActive()) return
+        if (!ensureTargetForeground()) return
+        currentInputMode = "点击输入框"
+        markStage(CycleFailureStage.LOCATE_INPUT)
+        val target = targetForRound
+        val screen = ScreenUtils.realSize(service)
+        setStatus("定位评论输入框")
+        LogStore.add("定位", "开始定位输入框（20ms 轮询，上限 2000ms，下一轮定位兼作上一轮校验）")
+        var hit: NodeHit? = null
+        awaitCondition(
+            timeoutMs = 2000L,
+            intervalMs = 20L,
+            condition = {
+                if (!isOperationActive()) {
+                    false
+                } else {
+                    val root = NodeTools.targetRoot(service, target)
+                    hit = root?.let { NodeTools.findInput(it, target, screen.x, screen.y) }
+                    hit != null
+                }
+            },
+            onResult = { found ->
+                if (!isOperationActive()) return@awaitCondition
+                val foundHit = hit
+                if (!found || foundHit == null) {
+                    fallbackInput("无障碍定位输入框失败（已轮询 2000ms）")
+                    return@awaitCondition
+                }
+                LogStore.add("定位", "找到输入框：${foundHit.shortDetail()} bounds=${foundHit.boundsLabel}")
+                if (!clickAt(foundHit.centerX, foundHit.centerY, "输入框")) {
+                    if (isOperationActive()) failRound("输入框点击未被系统接受")
+                    return@awaitCondition
+                }
+                markLocateFinished()
+                setStatus("已点击输入框，等待键盘")
+                later(randomBetween(450, 650).toLong()) { beginTextEntry(1) }
+            }
+        )
+    }
+
+    private fun awaitCondition(
+        timeoutMs: Long,
+        intervalMs: Long = 20L,
+        condition: () -> Boolean,
+        onResult: (Boolean) -> Unit
+    ) {
+        val startedAt = SystemClock.elapsedRealtime()
+        fun tick() {
+            if (!isOperationActive()) return
+            val ok = try {
+                condition()
+            } catch (_: Throwable) {
+                false
+            }
+            if (ok) {
+                onResult(true)
+                return
+            }
+            val elapsed = SystemClock.elapsedRealtime() - startedAt
+            if (elapsed >= timeoutMs) {
+                onResult(false)
+                return
+            }
+            val wait = intervalMs.coerceAtLeast(1L).coerceAtMost(timeoutMs - elapsed)
+            later(wait) { tick() }
+        }
+        tick()
     }
 
     private fun fallbackInput(reason: String) {
@@ -733,6 +888,9 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
             if (sendRootRetry < 1) {
                 sendRootRetry++
                 later(400L) { tapSend() }
+            } else if (currentInputMode == "直填") {
+                currentInputMode = "点击输入框"
+                fallbackToClickInput("直填后获取发送按钮窗口失败")
             } else {
                 fallbackSend("获取发送按钮窗口失败")
             }
@@ -745,6 +903,10 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
             if (sendMissingGrace < 1) {
                 sendMissingGrace++
                 later(400L) { tapSend() }
+            } else if (currentInputMode == "直填") {
+                currentInputMode = "点击输入框"
+                LogStore.add("发送", "直填后仍找不到发送按钮，回退点击输入框路径")
+                fallbackToClickInput("直填后无障碍定位发送按钮失败")
             } else {
                 fallbackSend("无障碍定位发送按钮失败")
             }
@@ -760,6 +922,12 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
                 later(400L) { tapSend() }
                 return
             }
+            if (currentInputMode == "直填") {
+                currentInputMode = "点击输入框"
+                LogStore.add("发送", "直填后发送按钮仍置灰，回退点击输入框路径")
+                fallbackToClickInput("直填后发送按钮置灰")
+                return
+            }
             if (sendRefillCount < 2) {
                 sendRefillCount++
                 setStatus("文字可能未写入，重新输入")
@@ -773,6 +941,20 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
 
         val hit = lookup.hit
         LogStore.add("发送", "找到发送按钮：${hit.shortDetail()} bounds=${hit.boundsLabel}")
+        if (cycleOrigin == CycleOrigin.MAIN_LOOP) {
+            val accepted = clickAt(hit.centerX, hit.centerY, "发送按钮") { completed ->
+                if (!isOperationActive()) return@clickAt
+                if (!completed) {
+                    failRound("发送手势被系统取消")
+                } else {
+                    markSendFinished()
+                    setStatus("已点击发送")
+                    onRoundSuccess("已点击发送（零等待，下一轮定位兼作校验）")
+                }
+            }
+            if (!accepted && isOperationActive()) failRound("发送按钮点击未被系统接受")
+            return
+        }
         if (!clickAt(hit.centerX, hit.centerY, "发送按钮")) {
             if (isOperationActive()) failRound("发送按钮点击未被系统接受")
             return
@@ -795,6 +977,20 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
         val x = ScreenUtils.normalizedToPx(settings.sendX, screen.x)
         val y = ScreenUtils.normalizedToPx(settings.sendY, screen.y)
         LogStore.add("发送", "$reason，使用校准坐标兜底发送按钮 ($x,$y)")
+        if (cycleOrigin == CycleOrigin.MAIN_LOOP) {
+            val accepted = clickAt(x, y, "发送按钮(校准)") { completed ->
+                if (!isOperationActive()) return@clickAt
+                if (!completed) {
+                    failRound("发送手势被系统取消")
+                } else {
+                    markSendFinished()
+                    setStatus("已点击发送")
+                    onRoundSuccess("已点击发送（零等待，下一轮定位兼作校验）")
+                }
+            }
+            if (!accepted && isOperationActive()) failRound("校准坐标点击发送按钮失败")
+            return
+        }
         if (!clickAt(x, y, "发送按钮(校准)")) {
             if (isOperationActive()) failRound("校准坐标点击发送按钮失败")
             return
@@ -860,8 +1056,10 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
             error = null,
             banSuspected = currentCycleBanSuspected,
             timings = buildCycleTimings(),
-            content = outgoing.fullText
+            content = outgoing.fullText,
+            path = currentInputMode.ifEmpty { "未进入输入" }
         )
+        recordLastRound(result, origin)
         roundActive = false
         nextRoundAtElapsed = 0L
         activeOutgoing = null
@@ -897,6 +1095,19 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
         }
     }
 
+    private fun recordLastRound(result: CycleResult, origin: CycleOrigin) {
+        lastRoundDurationMs = result.timings.totalMs
+        lastRoundPath = result.path
+        if (origin == CycleOrigin.SINGLE_SHOT) return
+        val t = result.timings
+        val label = if (origin == CycleOrigin.TRIAL) "试跑" else "第${roundSequence}轮"
+        LogStore.add(
+            "耗时",
+            "$label 路径=${result.path} 定位=${t.locateMs}ms 输入=${t.inputMs}ms " +
+                "发送=${t.sendMs}ms 空闲=${t.idleMs}ms 总计=${t.totalMs}ms"
+        )
+    }
+
     private fun failRound(reason: String) {
         val origin = cycleOrigin
         val stage = if (currentCycleStage == CycleFailureStage.NONE) {
@@ -910,8 +1121,10 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
             error = reason,
             banSuspected = currentCycleBanSuspected,
             timings = buildCycleTimings(),
-            content = activeOutgoing?.fullText ?: cycleContentSnapshot
+            content = activeOutgoing?.fullText ?: cycleContentSnapshot,
+            path = currentInputMode.ifEmpty { "未进入输入" }
         )
+        recordLastRound(result, origin)
         val wasTrial = origin == CycleOrigin.TRIAL
         cancelPendingCallbacks()
         roundActive = false
@@ -983,8 +1196,10 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
             error = reason,
             banSuspected = currentCycleBanSuspected,
             timings = buildCycleTimings(),
-            content = activeOutgoing?.fullText ?: cycleContentSnapshot
+            content = activeOutgoing?.fullText ?: cycleContentSnapshot,
+            path = currentInputMode.ifEmpty { "未进入输入" }
         )
+        recordLastRound(result, CycleOrigin.SINGLE_SHOT)
         cancelPendingCallbacks()
         singleShotRunning = false
         roundActive = false
@@ -1039,7 +1254,7 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
     private fun buildCycleTimings(): CycleTimings {
         val now = SystemClock.elapsedRealtime()
         if (cycleStartedAtElapsed <= 0L) {
-            return CycleTimings(0L, 0L, 0L, 0L, 0L)
+            return CycleTimings(0L, 0L, 0L, 0L, 0L, 0L)
         }
         val locateEnd = when {
             locateFinishedAtElapsed > 0L -> locateFinishedAtElapsed
@@ -1073,12 +1288,13 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
         } else {
             0L
         }
-        val totalMs = (now - cycleStartedAtElapsed).coerceAtLeast(0L)
+        val totalMs = currentCycleIdleMs + (now - cycleStartedAtElapsed).coerceAtLeast(0L)
         return CycleTimings(
             locateMs = locateMs,
             inputMs = inputMs,
             sendMs = sendMs,
             verifyMs = verifyMs,
+            idleMs = currentCycleIdleMs,
             totalMs = totalMs
         )
     }
@@ -1109,9 +1325,9 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
         LogStore.add(
             "补发",
             "结果=${singleShotResultHeadline(result)}；原文=\"${result.content}\"；" +
-                "耗时 定位=${timings.locateMs}ms 输入=${timings.inputMs}ms 发送=${timings.sendMs}ms " +
-                "校验=${timings.verifyMs}ms 总计=${timings.totalMs}ms；" +
-                "失败阶段=${cycleStageLabel(result.failureStage)}；" +
+                "路径=${result.path}；耗时 定位=${timings.locateMs}ms 输入=${timings.inputMs}ms " +
+                "发送=${timings.sendMs}ms 空闲=${timings.idleMs}ms 校验=${timings.verifyMs}ms " +
+                "总计=${timings.totalMs}ms；失败阶段=${cycleStageLabel(result.failureStage)}；" +
                 "失败原因=${result.error ?: "无"}；疑似禁言=${result.banSuspected}"
         )
     }
@@ -1194,7 +1410,12 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
         }
     }
 
-    private fun clickAt(x: Int, y: Int, label: String): Boolean {
+    private fun clickAt(
+        x: Int,
+        y: Int,
+        label: String,
+        onGestureResult: ((Boolean) -> Unit)? = null
+    ): Boolean {
         if (!isOperationActive()) return false
         val target = targetForRound
         val active = NodeTools.activePackage(service)
@@ -1208,7 +1429,7 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
         val jitterY = randomBetween(-3, 3)
         val clickX = (x + jitterX).coerceIn(1, (screen.x - 2).coerceAtLeast(1))
         val clickY = (y + jitterY).coerceIn(1, (screen.y - 2).coerceAtLeast(1))
-        val duration = randomBetween(30, 80).toLong()
+        val duration = randomBetween(25, 40).toLong()
         val path = Path().apply {
             moveTo(clickX.toFloat(), clickY.toFloat())
             lineTo((clickX + 1).toFloat(), (clickY + 1).toFloat())
@@ -1217,7 +1438,29 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
             .addStroke(GestureDescription.StrokeDescription(path, 0L, duration))
             .build()
         val accepted = try {
-            service.dispatchGesture(gesture, null, null)
+            val resultCallback = onGestureResult
+            if (resultCallback == null) {
+                service.dispatchGesture(gesture, null, null)
+            } else {
+                val epoch = operationEpoch
+                val callback = object : AccessibilityService.GestureResultCallback() {
+                    override fun onCompleted(gestureDescription: GestureDescription?) {
+                        deliverGestureResult(epoch, true)
+                    }
+
+                    override fun onCancelled(gestureDescription: GestureDescription?) {
+                        deliverGestureResult(epoch, false)
+                    }
+
+                    private fun deliverGestureResult(epoch: Int, completed: Boolean) {
+                        handler.post {
+                            if (destroyed || epoch != operationEpoch) return@post
+                            resultCallback(completed)
+                        }
+                    }
+                }
+                service.dispatchGesture(gesture, callback, null)
+            }
         } catch (t: Throwable) {
             LogStore.add("手势", "$label dispatchGesture 异常：${t.javaClass.simpleName}: ${t.message}")
             false

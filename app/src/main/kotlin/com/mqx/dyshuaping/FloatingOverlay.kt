@@ -52,6 +52,7 @@ class FloatingOverlay(
     private var statusDot: TextView? = null
     private var countText: TextView? = null
     private var countdownText: TextView? = null
+    private var lastRoundText: TextView? = null
     private var btnStart: TextView? = null
     private var btnPause: TextView? = null
     private var btnStop: TextView? = null
@@ -117,6 +118,11 @@ class FloatingOverlay(
         statusText?.text = ui.statusMessage
         statusDot?.setTextColor(statusColor(ui))
         countText?.text = context.getString(R.string.quick_count_format, ui.sentCount)
+        lastRoundText?.text = if (ui.lastRoundPath.isBlank()) {
+            "上一轮 --"
+        } else {
+            "上一轮 ${ui.lastRoundDurationMs} ms"
+        }
         updateCountdown()
         setActionEnabled(btnStart, !ui.roundActive && !ui.trialRunning && ui.phase != AutomationEngine.Phase.RUNNING)
         setActionEnabled(
@@ -290,6 +296,17 @@ class FloatingOverlay(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = dp(5f) })
+
+        val lastRound = TextView(service).apply {
+            text = "上一轮 --"
+            setTextColor(ContextCompat.getColor(service, R.color.text_dim))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+        }
+        lastRoundText = lastRound
+        container.addView(lastRound, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(3f) })
 
         val singleResult = TextView(service).apply {
             visibility = View.GONE

@@ -24,7 +24,6 @@ class AutomationAccessibilityService : AccessibilityService() {
 
     private var overlay: FloatingOverlay? = null
     private var calibrationInProgress = false
-    private var calibrationBackgroundPackage: String? = null
     private var calibrationOverlayWasVisible = false
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -90,7 +89,6 @@ class AutomationAccessibilityService : AccessibilityService() {
         engine = null
         instance = null
         calibrationInProgress = false
-        calibrationBackgroundPackage = null
         calibrationOverlayWasVisible = false
         mainHandler.removeCallbacksAndMessages(null)
         ControlService.stop(this)
@@ -133,7 +131,6 @@ class AutomationAccessibilityService : AccessibilityService() {
         }
 
         calibrationInProgress = true
-        calibrationBackgroundPackage = target
         engine?.pause()
         val wasOverlayVisible = overlay?.isShowing() == true
         calibrationOverlayWasVisible = wasOverlayVisible
@@ -144,11 +141,10 @@ class AutomationAccessibilityService : AccessibilityService() {
             // Keep the overlay visible until CalibrationActivity.onCreate calls
             // onCalibrationActivityOpened(); a visible overlay is the background
             // activity launch exemption we rely on here.
-            toast("校准层已打开；手指点哪儿准星就去哪儿")
+            toast("透明校准页已打开：先点评论输入框，再点发送按钮")
             mainHandler.postDelayed({
                 if (calibrationInProgress && !CalibrationActivity.isRunning()) {
                     calibrationInProgress = false
-                    calibrationBackgroundPackage = null
                     if (calibrationOverlayWasVisible) ensureOverlay()
                     calibrationOverlayWasVisible = false
                     LogStore.add("校准", "校准界面启动超时，已恢复悬浮窗")
@@ -157,7 +153,6 @@ class AutomationAccessibilityService : AccessibilityService() {
             }, 2500L)
         } else {
             calibrationInProgress = false
-            calibrationBackgroundPackage = null
             calibrationOverlayWasVisible = false
             toast("无法打开校准界面，请检查悬浮窗权限")
         }
@@ -165,15 +160,15 @@ class AutomationAccessibilityService : AccessibilityService() {
     }
 
     fun onCalibrationActivityOpened() {
-        if (!calibrationInProgress) return
+        // The transparent calibration page must be the only thing on top: any
+        // floating window would intercept touches and violate the empty-page rule.
         overlay?.hide(showToast = false)
     }
 
     fun onCalibrationScreenFinished() {
-        mainHandler.removeCallbacksAndMessages(null)
         if (!calibrationInProgress) return
+        mainHandler.removeCallbacksAndMessages(null)
         calibrationInProgress = false
-        calibrationBackgroundPackage = null
         val restoreOverlay = calibrationOverlayWasVisible
         calibrationOverlayWasVisible = false
         if (restoreOverlay) {
@@ -182,20 +177,14 @@ class AutomationAccessibilityService : AccessibilityService() {
         LogStore.add("校准", "校准界面已关闭")
     }
 
-    fun canTestCalibrationClick(): Boolean {
-        if (!calibrationInProgress) return false
-        val target = AppConfig.load(this).targetPackage
-        return calibrationBackgroundPackage == target
-    }
-
     /**
-     * Manual test tap from the calibration screen. The calibration Activity makes
-     * its own window non-touchable before calling this, so the injected gesture
-     * can reach the live room underneath.
+     * Raw tap replay used by the transparent calibration page. It deliberately
+     * does not require the live room to be the "active" window: the calibration
+     * Activity itself is active while the target app is visible underneath it.
      */
-    fun dispatchCalibrationTestClick(x: Int, y: Int): Boolean {
-        if (!canTestCalibrationClick()) {
-            toast("未确认抖音在后台，测试点击已取消")
+    fun dispatchCalibrationTap(x: Int, y: Int): Boolean {
+        if (!CalibrationActivity.isRunning()) {
+            LogStore.add("校准", "校准页不在运行，取消点击回放")
             return false
         }
         val screen = ScreenUtils.realSize(this)
@@ -214,10 +203,10 @@ class AutomationAccessibilityService : AccessibilityService() {
         val accepted = try {
             dispatchGesture(gesture, null, null)
         } catch (t: Throwable) {
-            LogStore.add("校准", "测试点击异常：${t.javaClass.simpleName}: ${t.message}")
+            LogStore.add("校准", "点击回放异常：${t.javaClass.simpleName}: ${t.message}")
             false
         }
-        LogStore.add("校准", "测试点击坐标=($cx,$cy) accepted=$accepted")
+        LogStore.add("校准", "点击回放坐标=($cx,$cy) accepted=$accepted")
         return accepted
     }
 
