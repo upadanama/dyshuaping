@@ -1,0 +1,900 @@
+package com.mqx.dyshuaping
+
+import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.graphics.Path
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import android.view.accessibility.AccessibilityNodeInfo
+import android.widget.Toast
+import java.util.Random
+import kotlin.math.ceil
+
+class AutomationEngine(private val service: AutomationAccessibilityService) {
+    enum class Phase {
+        IDLE,
+        RUNNING,
+        WAITING_TARGET,
+        PAUSED
+    }
+
+    data class UiState(
+        val phase: Phase,
+        val sentCount: Int,
+        val nextRoundAtElapsed: Long,
+        val roundActive: Boolean,
+        val trialRunning: Boolean,
+        val statusMessage: String
+    )
+
+    private enum class InputStrategy {
+        SET_TEXT,
+        PASTE
+    }
+
+    private data class Outgoing(
+        val settings: Settings,
+        val baseMessage: String,
+        val suffix: String,
+        val fullText: String,
+        val roundNumber: Int
+    )
+
+    var onChanged: (() -> Unit)? = null
+
+    private val handler = Handler(Looper.getMainLooper())
+    private val scheduleToken = Any()
+    private val random = Random()
+
+    private var destroyed = false
+    private var phase = Phase.IDLE
+    private var statusMessage = "未开始"
+    private var sentCount = 0
+    private var failureCount = 0
+    private var nextRoundAtElapsed = 0L
+    private var operationEpoch = 0
+    private var roundActive = false
+    private var trialRunning = false
+    private var currentRoundIsTrial = false
+    private var roundSequence = 0
+    private var activeOutgoing: Outgoing? = null
+    private var targetForRound = ""
+
+    private var trialRestorePhase = Phase.IDLE
+    private var trialRestoreStatus = "未开始"
+
+    private var sendDisabledGrace = 0
+    private var sendMissingGrace = 0
+    private var sendRootRetry = 0
+    private var sendRefillCount = 0
+
+    fun snapshot(): UiState = UiState(
+        phase = phase,
+        sentCount = sentCount,
+        nextRoundAtElapsed = if (phase == Phase.RUNNING && !roundActive) nextRoundAtElapsed else 0L,
+        roundActive = roundActive,
+        trialRunning = trialRunning,
+        statusMessage = when {
+            trialRunning -> "试跑中 · $statusMessage"
+            else -> statusMessage
+        }
+    )
+
+    fun start() {
+        if (destroyed) return
+        if (trialRunning || roundActive) {
+            toast("正在执行，请稍候")
+            return
+        }
+        if (phase == Phase.RUNNING) {
+            toast("已在运行中")
+            return
+        }
+        val settings = AppConfig.load(service)
+        if (settings.messages.isEmpty()) {
+            phase = Phase.PAUSED
+            statusMessage = "消息列表为空，无法开始"
+            LogStore.add("状态", "启动失败：消息列表为空")
+            toast("请先在设置中填写至少一条评论")
+            notifyChanged()
+            return
+        }
+        if (settings.targetPackage.isBlank()) {
+            phase = Phase.PAUSED
+            statusMessage = "目标包名为空，无法开始"
+            LogStore.add("状态", "启动失败：目标包名为空")
+            toast("请先填写目标应用包名")
+            notifyChanged()
+            return
+        }
+
+        val resuming = phase != Phase.IDLE
+        cancelPendingCallbacks()
+        trialRunning = false
+        currentRoundIsTrial = false
+        roundActive = false
+        activeOutgoing = null
+        failureCount = 0
+        phase = Phase.RUNNING
+        statusMessage = if (resuming) "继续运行，准备开始" else "准备开始"
+        LogStore.add("状态", if (resuming) "继续运行（计数保留）" else "开始运行")
+        notifyChanged()
+
+        val active = NodeTools.activePackage(service)
+        if (active != null && active != settings.targetPackage) {
+            enterWaitingTarget("当前不是抖音：切回抖音后自动开始", toastIt = true)
+            return
+        }
+        scheduleInitialRound(resuming)
+    }
+
+    fun pause() {
+        if (destroyed) return
+        if (phase == Phase.IDLE && !roundActive && !trialRunning) return
+        val wasTrial = trialRunning
+        cancelPendingCallbacks()
+        roundActive = false
+        nextRoundAtElapsed = 0L
+        activeOutgoing = null
+        trialRunning = false
+        currentRoundIsTrial = false
+        phase = Phase.PAUSED
+        statusMessage = if (wasTrial) "已暂停（试跑已取消），计数保留" else "已暂停，计数保留"
+        LogStore.add("状态", "手动暂停，已发送 $sentCount 条")
+        notifyChanged()
+    }
+
+    fun stop() {
+        if (destroyed) return
+        cancelPendingCallbacks()
+        phase = Phase.IDLE
+        roundActive = false
+        trialRunning = false
+        currentRoundIsTrial = false
+        nextRoundAtElapsed = 0L
+        sentCount = 0
+        failureCount = 0
+        activeOutgoing = null
+        MessageProvider.reset()
+        statusMessage = "已停止，计数已清零"
+        LogStore.add("状态", "已停止，发送计数清零")
+        notifyChanged()
+    }
+
+    fun toggle() {
+        if (trialRunning || phase == Phase.RUNNING) {
+            pause()
+        } else {
+            start()
+        }
+    }
+
+    fun trialOnce() {
+        if (destroyed) return
+        if (roundActive || trialRunning) {
+            toast("正在执行，请稍候")
+            return
+        }
+        if (phase == Phase.RUNNING) {
+            toast("请先暂停，再手动试跑一轮")
+            return
+        }
+        val settings = AppConfig.load(service)
+        if (settings.messages.isEmpty()) {
+            toast("请先填写至少一条评论")
+            return
+        }
+        val active = NodeTools.activePackage(service)
+        if (active == null || active != settings.targetPackage) {
+            LogStore.add("试跑", "无法试跑：当前前台不是目标应用。前台=${active ?: "<null>"} 目标=${settings.targetPackage}")
+            toast("请先进入抖音直播间，再点试一轮")
+            return
+        }
+
+        cancelPendingCallbacks()
+        trialRestorePhase = phase
+        trialRestoreStatus = statusMessage
+        trialRunning = true
+        currentRoundIsTrial = true
+        roundActive = false
+        phase = if (phase == Phase.WAITING_TARGET) Phase.PAUSED else phase
+        statusMessage = "准备手动试跑"
+        LogStore.add("试跑", "开始手动试跑一轮")
+        notifyChanged()
+        beginRound(isTrial = true)
+    }
+
+    fun onForegroundPackageChanged(packageName: String) {
+        if (destroyed) return
+        val target = AppConfig.load(service).targetPackage
+        if (packageName == target) {
+            if (phase == Phase.WAITING_TARGET) {
+                failureCount = 0
+                phase = Phase.RUNNING
+                statusMessage = "已回到抖音，准备继续"
+                LogStore.add("状态", "目标应用回到前台，自动继续")
+                toast("已回到抖音，自动继续")
+                notifyChanged()
+                scheduleInitialRound(fromResume = true)
+            }
+            return
+        }
+        if (phase == Phase.RUNNING) {
+            handleWrongForeground(packageName)
+        }
+    }
+
+    fun onInterrupt() {
+        if (destroyed) return
+        if (phase == Phase.IDLE && !roundActive && !trialRunning) return
+        cancelPendingCallbacks()
+        roundActive = false
+        trialRunning = false
+        currentRoundIsTrial = false
+        nextRoundAtElapsed = 0L
+        activeOutgoing = null
+        phase = Phase.PAUSED
+        statusMessage = "无障碍服务被系统中断，已暂停"
+        LogStore.add("状态", "onInterrupt：任务已暂停")
+        notifyChanged()
+    }
+
+    fun destroy() {
+        destroyed = true
+        cancelPendingCallbacks()
+        activeOutgoing = null
+        onChanged = null
+        handler.removeCallbacksAndMessages(null)
+    }
+
+    private fun scheduleInitialRound(fromResume: Boolean) {
+        if (phase != Phase.RUNNING || trialRunning || destroyed) return
+        cancelPendingCallbacks()
+        val jitter = randomBetween(0, 800).toLong()
+        nextRoundAtElapsed = SystemClock.elapsedRealtime() + jitter
+        statusMessage = if (fromResume) "回到抖音，准备继续" else "准备开始"
+        notifyChanged()
+        later(jitter) { beginRound(isTrial = false) }
+    }
+
+    private fun scheduleNextRound() {
+        if (phase != Phase.RUNNING || trialRunning || destroyed) return
+        val settings = AppConfig.load(service)
+        if (settings.messages.isEmpty()) {
+            cancelPendingCallbacks()
+            phase = Phase.PAUSED
+            statusMessage = "消息列表为空，已自动暂停"
+            LogStore.add("状态", "消息列表被清空，已自动暂停")
+            notifyChanged()
+            return
+        }
+        cancelPendingCallbacks()
+        val intervalMs = randomBetween(settings.intervalMinSec, settings.intervalMaxSec).toLong() * 1000L
+        val jitterMs = randomBetween(0, 800).toLong()
+        val delay = intervalMs + jitterMs
+        nextRoundAtElapsed = SystemClock.elapsedRealtime() + delay
+        statusMessage = "等待下一轮"
+        LogStore.add(
+            "节奏",
+            "下一轮等待 ${"%.1f".format(delay / 1000.0)} 秒（间隔 ${settings.intervalMinSec}~${settings.intervalMaxSec}s + 抖动 ${jitterMs}ms）"
+        )
+        notifyChanged()
+        later(delay) { beginRound(isTrial = false) }
+    }
+
+    private fun beginRound(isTrial: Boolean) {
+        if (destroyed) return
+        if (isTrial) {
+            if (!trialRunning) return
+        } else {
+            if (phase != Phase.RUNNING || trialRunning || roundActive) return
+        }
+        cancelPendingCallbacks()
+        roundActive = true
+        currentRoundIsTrial = isTrial
+        sendDisabledGrace = 0
+        sendMissingGrace = 0
+        sendRootRetry = 0
+        sendRefillCount = 0
+        activeOutgoing = null
+
+        val settings = AppConfig.load(service)
+        targetForRound = settings.targetPackage
+        if (settings.messages.isEmpty()) {
+            failRound("消息列表为空")
+            return
+        }
+        if (targetForRound.isBlank()) {
+            failRound("目标包名为空")
+            return
+        }
+
+        val active = NodeTools.activePackage(service)
+        if (active != null && active != targetForRound) {
+            roundActive = false
+            if (isTrial) {
+                finishTrialAfterInterruption("当前前台不是目标应用")
+            } else {
+                enterWaitingTarget("当前不是抖音：切回抖音后自动继续", toastIt = false)
+            }
+            return
+        }
+
+        val base = MessageProvider.peek(settings)
+        if (base == null) {
+            failRound("没有可发送的消息")
+            return
+        }
+        val suffix = SuffixGenerator.build(settings)
+        val fullText = base + suffix
+        roundSequence++
+        val outgoing = Outgoing(settings, base, suffix, fullText, roundSequence)
+        activeOutgoing = outgoing
+        statusMessage = "第${roundSequence}轮：定位输入框"
+        LogStore.add(
+            "轮次",
+            "开始第${roundSequence}轮（${if (isTrial) "手动试跑" else "自动"}），目标=${targetForRound}，文本=\"$fullText\""
+        )
+        notifyChanged()
+        locateInput(0)
+    }
+
+    private fun locateInput(attempt: Int) {
+        if (!isOperationActive()) return
+        if (!ensureTargetForeground()) return
+        val target = targetForRound
+        val screen = ScreenUtils.realSize(service)
+        setStatus("定位评论输入框")
+        val root = NodeTools.targetRoot(service, target)
+        if (root == null) {
+            LogStore.add("定位", "获取窗口 root 失败（第${attempt + 1}次），500ms 后重试")
+            if (attempt < 2) {
+                later(500L) { locateInput(attempt + 1) }
+            } else {
+                fallbackInput("连续获取窗口失败/未找到输入框")
+            }
+            return
+        }
+        val hit = NodeTools.findInput(root, target, screen.x, screen.y)
+        if (hit == null) {
+            LogStore.add("定位", "未找到输入框节点（第${attempt + 1}次），500ms 后重试")
+            if (attempt < 2) {
+                later(500L) { locateInput(attempt + 1) }
+            } else {
+                fallbackInput("无障碍定位输入框失败")
+            }
+            return
+        }
+
+        LogStore.add("定位", "找到输入框：${hit.shortDetail()} bounds=${hit.boundsLabel}")
+        if (!clickAt(hit.centerX, hit.centerY, "输入框")) {
+            if (isOperationActive()) failRound("输入框点击未被系统接受")
+            return
+        }
+        setStatus("已点击输入框，等待键盘")
+        later(randomBetween(450, 650).toLong()) { beginTextEntry(1) }
+    }
+
+    private fun fallbackInput(reason: String) {
+        if (!isOperationActive()) return
+        if (!ensureTargetForeground()) return
+        val settings = activeOutgoing?.settings ?: AppConfig.load(service)
+        if (!settings.hasCalibration) {
+            failRound("$reason，且尚未校准坐标")
+            return
+        }
+        val screen = ScreenUtils.realSize(service)
+        val x = ScreenUtils.normalizedToPx(settings.inputX, screen.x)
+        val y = ScreenUtils.normalizedToPx(settings.inputY, screen.y)
+        LogStore.add("定位", "$reason，使用校准坐标兜底输入框 ($x,$y)")
+        if (!clickAt(x, y, "输入框(校准)")) {
+            if (isOperationActive()) failRound("校准坐标点击输入框失败")
+            return
+        }
+        setStatus("使用校准坐标，等待键盘")
+        later(500L) { beginTextEntry(1) }
+    }
+
+    private fun beginTextEntry(attempt: Int) {
+        if (!isOperationActive()) return
+        if (!ensureTargetForeground()) return
+        if (attempt > 3) {
+            failRound("输入重试次数耗尽")
+            return
+        }
+        setStatus("写入文字（第${attempt}次）")
+        val target = targetForRound
+        val screen = ScreenUtils.realSize(service)
+        val root = NodeTools.targetRoot(service, target)
+        if (root == null) {
+            LogStore.add("输入", "写入前获取窗口失败（第${attempt}次）")
+            if (attempt < 3) {
+                later(450L) { beginTextEntry(attempt + 1) }
+            } else {
+                failRound("找不到输入窗口")
+            }
+            return
+        }
+
+        val focused = NodeTools.findEditable(root, target, screen.x, screen.y, requireFocused = true)
+        val editable = focused ?: NodeTools.findEditable(root, target, screen.x, screen.y, requireFocused = false)
+        if (editable == null) {
+            LogStore.add("输入", "找不到可编辑输入框（第${attempt}次），等待键盘弹起")
+            if (attempt < 3) {
+                later(450L) { beginTextEntry(attempt + 1) }
+            } else {
+                failRound("找不到可编辑输入框")
+            }
+            return
+        }
+
+        val focusOk = try {
+            editable.node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        } catch (_: Throwable) {
+            false
+        }
+        LogStore.add(
+            "输入",
+            "第${attempt}次聚焦输入框：focusAction=$focusOk，节点=${editable.hit.shortDetail()}，bounds=${editable.hit.boundsLabel}"
+        )
+        later(160L) { setTextOnEditable(attempt, InputStrategy.SET_TEXT) }
+    }
+
+    private fun setTextOnEditable(attempt: Int, strategy: InputStrategy) {
+        if (!isOperationActive()) return
+        if (!ensureTargetForeground()) return
+        val outgoing = activeOutgoing ?: return
+        val target = targetForRound
+        val screen = ScreenUtils.realSize(service)
+        val root = NodeTools.targetRoot(service, target)
+        if (root == null) {
+            retryTextEntry(attempt, "写入时获取窗口失败")
+            return
+        }
+        val focused = NodeTools.findEditable(root, target, screen.x, screen.y, requireFocused = true)
+        val editable = focused ?: NodeTools.findEditable(root, target, screen.x, screen.y, requireFocused = false)
+        if (editable == null) {
+            retryTextEntry(attempt, "写入时找不到可编辑节点")
+            return
+        }
+
+        if (strategy == InputStrategy.SET_TEXT) {
+            val arguments = Bundle().apply {
+                putCharSequence(
+                    AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                    outgoing.fullText
+                )
+            }
+            val ok = try {
+                editable.node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments)
+            } catch (_: Throwable) {
+                false
+            }
+            LogStore.add("输入", "第${attempt}次 ACTION_SET_TEXT 结果=$ok，文本长度=${outgoing.fullText.length}")
+            later(280L) { verifyText(attempt, strategy) }
+        } else {
+            val clipboardOk = try {
+                val clipboard = service.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                clipboard.setPrimaryClip(ClipData.newPlainText("dyshuaping", outgoing.fullText))
+                true
+            } catch (_: Throwable) {
+                false
+            }
+            val ok = try {
+                editable.node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+            } catch (_: Throwable) {
+                false
+            }
+            LogStore.add("输入", "第${attempt}次剪贴板粘贴：写入剪贴板=$clipboardOk，ACTION_PASTE=$ok")
+            later(350L) { verifyText(attempt, strategy) }
+        }
+    }
+
+    private fun verifyText(attempt: Int, strategy: InputStrategy) {
+        if (!isOperationActive()) return
+        if (!ensureTargetForeground()) return
+        val outgoing = activeOutgoing ?: return
+        val target = targetForRound
+        val screen = ScreenUtils.realSize(service)
+        val root = NodeTools.targetRoot(service, target)
+        if (root == null) {
+            retryTextEntry(attempt, "校验文字时获取窗口失败")
+            return
+        }
+        val focused = NodeTools.findEditable(root, target, screen.x, screen.y, requireFocused = true)
+        val editable = focused ?: NodeTools.findEditable(root, target, screen.x, screen.y, requireFocused = false)
+        if (editable == null) {
+            retryTextEntry(attempt, "校验文字时找不到可编辑节点")
+            return
+        }
+
+        val actual = editable.hit.text.orEmpty()
+        val verified = actual.contains(outgoing.fullText)
+        val source = if (focused != null) "焦点输入框" else "可编辑节点"
+        LogStore.add(
+            "输入",
+            "第${attempt}次校验（${if (strategy == InputStrategy.SET_TEXT) "SET_TEXT" else "PASTE"}）：" +
+                "verified=$verified，$source text=\"${actual.take(80)}\""
+        )
+        if (verified) {
+            setStatus("文字已写入，准备点击发送")
+            later(280L) { tapSend() }
+            return
+        }
+
+        if (strategy == InputStrategy.SET_TEXT) {
+            LogStore.add("输入", "SET_TEXT 校验未通过，改用剪贴板粘贴")
+            later(160L) { setTextOnEditable(attempt, InputStrategy.PASTE) }
+        } else {
+            retryTextEntry(attempt, "粘贴后文字校验仍未通过")
+        }
+    }
+
+    private fun retryTextEntry(attempt: Int, reason: String) {
+        if (!isOperationActive()) return
+        LogStore.add("输入", reason)
+        if (attempt < 3) {
+            later(350L) { beginTextEntry(attempt + 1) }
+        } else {
+            failRound("输入文字失败：$reason")
+        }
+    }
+
+    private fun tapSend() {
+        if (!isOperationActive()) return
+        if (!ensureTargetForeground()) return
+        setStatus("查找发送按钮")
+        val target = targetForRound
+        val screen = ScreenUtils.realSize(service)
+        val root = NodeTools.targetRoot(service, target)
+        if (root == null) {
+            LogStore.add("发送", "查找发送按钮时获取窗口失败")
+            if (sendRootRetry < 1) {
+                sendRootRetry++
+                later(400L) { tapSend() }
+            } else {
+                fallbackSend("获取发送按钮窗口失败")
+            }
+            return
+        }
+
+        val lookup = NodeTools.findSend(root, target, screen.x, screen.y)
+        if (lookup.hit == null) {
+            LogStore.add("发送", "未找到可用发送节点：${lookup.detail}")
+            if (sendMissingGrace < 1) {
+                sendMissingGrace++
+                later(400L) { tapSend() }
+            } else {
+                fallbackSend("无障碍定位发送按钮失败")
+            }
+            return
+        }
+
+        if (lookup.disabled) {
+            LogStore.add("发送", "发送按钮不可点击/置灰：${lookup.detail}")
+            if (sendDisabledGrace < 1) {
+                sendDisabledGrace++
+                setStatus("发送按钮置灰，稍后重查")
+                later(400L) { tapSend() }
+                return
+            }
+            if (sendRefillCount < 2) {
+                sendRefillCount++
+                setStatus("文字可能未写入，重新输入")
+                LogStore.add("发送", "发送按钮仍置灰，回到输入步骤重新写入（${sendRefillCount}/2）")
+                later(300L) { beginTextEntry(1) }
+                return
+            }
+            failRound("发送按钮始终置灰，文字可能未写入")
+            return
+        }
+
+        val hit = lookup.hit
+        LogStore.add("发送", "找到发送按钮：${hit.shortDetail()} bounds=${hit.boundsLabel}")
+        if (!clickAt(hit.centerX, hit.centerY, "发送按钮")) {
+            if (isOperationActive()) failRound("发送按钮点击未被系统接受")
+            return
+        }
+        setStatus("已点击发送，校验结果")
+        later(randomBetween(800, 1500).toLong()) { checkSendResult(first = true) }
+    }
+
+    private fun fallbackSend(reason: String) {
+        if (!isOperationActive()) return
+        if (!ensureTargetForeground()) return
+        val settings = activeOutgoing?.settings ?: AppConfig.load(service)
+        if (!settings.hasCalibration) {
+            failRound("$reason，且尚未校准发送按钮坐标")
+            return
+        }
+        val screen = ScreenUtils.realSize(service)
+        val x = ScreenUtils.normalizedToPx(settings.sendX, screen.x)
+        val y = ScreenUtils.normalizedToPx(settings.sendY, screen.y)
+        LogStore.add("发送", "$reason，使用校准坐标兜底发送按钮 ($x,$y)")
+        if (!clickAt(x, y, "发送按钮(校准)")) {
+            if (isOperationActive()) failRound("校准坐标点击发送按钮失败")
+            return
+        }
+        setStatus("已点击校准发送坐标，校验结果")
+        later(randomBetween(800, 1500).toLong()) { checkSendResult(first = true) }
+    }
+
+    private fun checkSendResult(first: Boolean) {
+        if (!isOperationActive()) return
+        if (!ensureTargetForeground()) return
+        val target = targetForRound
+        val screen = ScreenUtils.realSize(service)
+        val root = NodeTools.targetRoot(service, target)
+        if (root == null) {
+            LogStore.add("发送", "校验发送结果时获取窗口失败")
+            if (first) {
+                later(500L) { checkSendResult(first = false) }
+            } else {
+                failRound("无法确认发送结果：窗口不可用")
+            }
+            return
+        }
+
+        val send = NodeTools.findSend(root, target, screen.x, screen.y)
+        val placeholder = NodeTools.findInput(
+            root,
+            target,
+            screen.x,
+            screen.y,
+            placeholderOnly = true,
+            includeEditableFallback = false
+        )
+        if (placeholder != null) {
+            onRoundSuccess("输入框占位符重新出现")
+            return
+        }
+        if (send.hit == null) {
+            onRoundSuccess("发送按钮节点已消失")
+            return
+        }
+        if (send.disabled) {
+            onRoundSuccess("发送按钮已不可点击")
+            return
+        }
+
+        LogStore.add("发送", "发送按钮仍在且可点击")
+        if (first) {
+            later(650L) { checkSendResult(first = false) }
+        } else {
+            failRound("发送按钮仍在且仍可点击")
+        }
+    }
+
+    private fun onRoundSuccess(reason: String) {
+        val outgoing = activeOutgoing ?: return
+        val wasTrial = currentRoundIsTrial && trialRunning
+        roundActive = false
+        currentRoundIsTrial = false
+        nextRoundAtElapsed = 0L
+        activeOutgoing = null
+        cancelPendingCallbacks()
+        sentCount++
+        failureCount = 0
+        MessageProvider.advanceAfterSuccess(outgoing.settings)
+        if (outgoing.suffix.isNotEmpty()) {
+            SuffixGenerator.markUsed(outgoing.suffix)
+        }
+        LogStore.add(
+            "轮次",
+            "✅ 第${outgoing.roundNumber}轮发送成功（$reason），已发送 $sentCount 条，后缀=\"${outgoing.suffix}\""
+        )
+        if (wasTrial) {
+            trialRunning = false
+            phase = trialRestorePhase
+            statusMessage = "试跑成功 · 已发送 $sentCount 条"
+            toast("试跑成功，已发送 $sentCount 条")
+            notifyChanged()
+        } else {
+            statusMessage = "发送成功 · 已发送 $sentCount 条"
+            notifyChanged()
+            scheduleNextRound()
+        }
+    }
+
+    private fun failRound(reason: String) {
+        val wasTrial = currentRoundIsTrial && trialRunning
+        cancelPendingCallbacks()
+        roundActive = false
+        currentRoundIsTrial = false
+        activeOutgoing = null
+        nextRoundAtElapsed = 0L
+        LogStore.add("轮次", "❌ 第${roundSequence}轮失败：$reason")
+
+        if (wasTrial) {
+            trialRunning = false
+            phase = trialRestorePhase
+            statusMessage = "试跑失败：$reason"
+            toast("试跑失败：$reason")
+            notifyChanged()
+            return
+        }
+        if (phase != Phase.RUNNING) {
+            notifyChanged()
+            return
+        }
+
+        failureCount++
+        if (failureCount >= 3) {
+            phase = Phase.PAUSED
+            statusMessage = "连续失败 3 次，已自动暂停"
+            LogStore.add("状态", "连续失败 3 次，自动暂停以避免空转")
+            toast("连续失败 3 次，已自动暂停")
+            notifyChanged()
+        } else {
+            statusMessage = "本轮失败：$reason"
+            LogStore.add("状态", "连续失败 ${failureCount}/3，继续下一轮")
+            notifyChanged()
+            scheduleNextRound()
+        }
+    }
+
+    private fun handleWrongForeground(activePackage: String) {
+        if (destroyed) return
+        val target = targetForRound.ifEmpty { AppConfig.load(service).targetPackage }
+        if (activePackage == target) return
+        if (trialRunning) {
+            cancelPendingCallbacks()
+            roundActive = false
+            activeOutgoing = null
+            trialRunning = false
+            currentRoundIsTrial = false
+            phase = Phase.PAUSED
+            statusMessage = "试跑已中断：已离开抖音"
+            LogStore.add("状态", "检测到前台 ${activePackage}，试跑中断并暂停")
+            toast("已离开抖音，试跑中断")
+            notifyChanged()
+            return
+        }
+        if (phase == Phase.RUNNING) {
+            cancelPendingCallbacks()
+            roundActive = false
+            activeOutgoing = null
+            phase = Phase.WAITING_TARGET
+            statusMessage = "已离开抖音：切回后自动继续"
+            LogStore.add("状态", "检测到前台 ${activePackage}，非目标应用，自动暂停")
+            toast("已离开抖音，切回后自动继续")
+            notifyChanged()
+        }
+    }
+
+    private fun finishTrialAfterInterruption(reason: String) {
+        cancelPendingCallbacks()
+        roundActive = false
+        activeOutgoing = null
+        trialRunning = false
+        currentRoundIsTrial = false
+        phase = Phase.PAUSED
+        statusMessage = "试跑中断：$reason"
+        LogStore.add("试跑", reason)
+        toast("试跑中断：$reason")
+        notifyChanged()
+    }
+
+    private fun enterWaitingTarget(message: String, toastIt: Boolean) {
+        cancelPendingCallbacks()
+        roundActive = false
+        nextRoundAtElapsed = 0L
+        activeOutgoing = null
+        phase = Phase.WAITING_TARGET
+        statusMessage = message
+        LogStore.add("状态", message)
+        if (toastIt) toast(message)
+        notifyChanged()
+    }
+
+    private fun ensureTargetForeground(): Boolean {
+        if (destroyed) return false
+        val active = NodeTools.activePackage(service)
+        if (active == null) return true
+        if (active != targetForRound) {
+            handleWrongForeground(active)
+            return false
+        }
+        return true
+    }
+
+    private fun isOperationActive(): Boolean {
+        if (destroyed || !roundActive) return false
+        return if (currentRoundIsTrial) {
+            trialRunning
+        } else {
+            phase == Phase.RUNNING
+        }
+    }
+
+    private fun clickAt(x: Int, y: Int, label: String): Boolean {
+        if (!isOperationActive()) return false
+        val target = targetForRound
+        val active = NodeTools.activePackage(service)
+        if (active == null || active != target) {
+            if (active != null) handleWrongForeground(active)
+            LogStore.add("手势", "$label 点击取消：当前无法确认目标应用在前台（前台=${active ?: "<null>"}，目标=$target）")
+            return false
+        }
+        val screen = ScreenUtils.realSize(service)
+        val jitterX = randomBetween(-3, 3)
+        val jitterY = randomBetween(-3, 3)
+        val clickX = (x + jitterX).coerceIn(1, (screen.x - 2).coerceAtLeast(1))
+        val clickY = (y + jitterY).coerceIn(1, (screen.y - 2).coerceAtLeast(1))
+        val duration = randomBetween(30, 80).toLong()
+        val path = Path().apply {
+            moveTo(clickX.toFloat(), clickY.toFloat())
+            lineTo((clickX + 1).toFloat(), (clickY + 1).toFloat())
+        }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0L, duration))
+            .build()
+        val accepted = try {
+            service.dispatchGesture(gesture, null, null)
+        } catch (t: Throwable) {
+            LogStore.add("手势", "$label dispatchGesture 异常：${t.javaClass.simpleName}: ${t.message}")
+            false
+        }
+        LogStore.add("手势", "$label 点击坐标=($clickX,$clickY) 按压=${duration}ms accepted=$accepted")
+        return accepted
+    }
+
+    private fun setStatus(message: String) {
+        statusMessage = message
+        notifyChanged()
+    }
+
+    private fun notifyChanged() {
+        if (destroyed) return
+        try {
+            onChanged?.invoke()
+        } catch (t: Throwable) {
+            LogStore.add("状态", "刷新界面失败：${t.javaClass.simpleName}")
+        }
+    }
+
+    private fun cancelPendingCallbacks() {
+        operationEpoch++
+        handler.removeCallbacksAndMessages(scheduleToken)
+        nextRoundAtElapsed = 0L
+    }
+
+    private fun later(delayMs: Long, action: () -> Unit) {
+        val epoch = operationEpoch
+        val runnable = Runnable {
+            if (!destroyed && epoch == operationEpoch) {
+                try {
+                    action()
+                } catch (t: Throwable) {
+                    LogStore.add("异常", "步骤执行异常：${t.javaClass.simpleName}: ${t.message}")
+                    if (isOperationActive()) {
+                        failRound("步骤异常：${t.javaClass.simpleName}")
+                    }
+                }
+            }
+        }
+        handler.postAtTime(
+            runnable,
+            scheduleToken,
+            SystemClock.uptimeMillis() + delayMs.coerceAtLeast(0L)
+        )
+    }
+
+    private fun randomBetween(min: Int, max: Int): Int {
+        val low = minOf(min, max)
+        val high = maxOf(min, max)
+        return low + random.nextInt(high - low + 1)
+    }
+
+    private fun toast(message: String) {
+        try {
+            Toast.makeText(service, message, Toast.LENGTH_SHORT).show()
+        } catch (_: Throwable) {
+        }
+    }
+}

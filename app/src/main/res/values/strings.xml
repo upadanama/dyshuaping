@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">抖屏助手</string>
+    <string name="accessibility_service_label">抖屏助手 · 自动评论</string>
+    <string name="accessibility_desc">仅用于在你手动开启后，操作抖音直播间评论框。只读取目标包名的窗口，不操作其他应用。</string>
+    <string name="accessibility_summary">直播间自动评论调试工具</string>
+    <string name="notification_channel_name">自动评论运行状态</string>
+    <string name="notification_channel_desc">常驻运行状态，并提供暂停 / 继续 / 停止控制。</string>
+    <string name="notification_title">抖屏助手</string>
+
+    <string name="main_title">抖屏助手</string>
+    <string name="main_subtitle">抖音直播间自动评论 · 本机调试版 v1.0.0</string>
+    <string name="section_permissions">运行权限</string>
+    <string name="permission_overlay_title">悬浮窗权限</string>
+    <string name="permission_overlay_desc">显示开始 / 暂停 / 停止悬浮面板</string>
+    <string name="permission_notification_title">通知权限</string>
+    <string name="permission_notification_desc">常驻通知栏控制与防杀</string>
+    <string name="permission_accessibility_title">无障碍服务</string>
+    <string name="permission_accessibility_desc">读取评论框节点并执行点击、输入</string>
+    <string name="status_granted">已授权</string>
+    <string name="status_not_granted">未授权</string>
+    <string name="status_enabled">已开启</string>
+    <string name="status_disabled">未开启</string>
+    <string name="action_grant">去授权</string>
+    <string name="action_enable">去开启</string>
+    <string name="action_manage">去设置</string>
+    <string name="permission_coloros_hint">Android 13+ / ColorOS：安装后请进入「应用信息 → 右上角 ⋮ → 允许受限设置」，否则无障碍开关可能是灰的。小米 / vivo 也请允许“后台弹出界面”和自启动，避免悬浮窗被回收。</string>
+
+    <string name="section_quick_control">快捷控制</string>
+    <string name="quick_status_disconnected">无障碍服务未连接，请先完成上方授权</string>
+    <string name="quick_status_idle">未开始</string>
+    <string name="quick_status_running">运行中</string>
+    <string name="quick_status_paused">已暂停</string>
+    <string name="quick_status_waiting">等待切回抖音</string>
+    <string name="quick_status_trial">试跑中</string>
+    <string name="quick_count_format">已发送 %1$d 条</string>
+    <string name="action_start">开始</string>
+    <string name="action_pause">暂停</string>
+    <string name="action_stop">停止</string>
+    <string name="action_show_overlay">显示 / 恢复悬浮窗</string>
+    <string name="quick_usage">建议流程：先进入抖音直播间 → 回到本页点「开始」→ 再切回抖音。离开抖音会自动暂停，切回后自动继续；如需手动停住，请按「暂停」。</string>
+
+    <string name="section_messages">评论内容</string>
+    <string name="label_messages">消息列表（一行一条，自动忽略空行）</string>
+    <string name="hint_messages">主播唱得真好听\n来了来了，支持一下\n讲得真好，学到了</string>
+    <string name="label_send_mode">发送模式</string>
+    <string name="mode_random">随机抽取</string>
+    <string name="mode_sequential">顺序循环</string>
+
+    <string name="section_suffix">防重复后缀</string>
+    <string name="label_suffix_enabled">启用后缀（避免短时间重复同一句）</string>
+    <string name="label_suffix_types">后缀类型（可多选）</string>
+    <string name="suffix_symbols">符号</string>
+    <string name="suffix_numbers">数字</string>
+    <string name="suffix_emoji">抖音表情代码</string>
+    <string name="label_suffix_count">每条追加数量：%1$d 个</string>
+    <string name="suffix_hint">符号：~ ～ … !! ？？ 。。 ☀ 🌙 ✨ 🍀 👍　表情：[比心] [爱心] [鼓掌] [玫瑰] [666] [一起加油] [坏笑] [礼物] [黄脸祈祷] [害羞] [微笑]</string>
+    <string name="suffix_recent_hint">最近 20 条已用的完整后缀会尽量避开；组合不足时可能重复。</string>
+
+    <string name="section_timing">发送节奏</string>
+    <string name="label_interval_min">最小间隔：%1$d 秒</string>
+    <string name="label_interval_max">最大间隔：%1$d 秒</string>
+    <string name="timing_hint">实际等待 = 随机间隔 + 每轮开始 0~800ms 抖动；点击坐标 ±3px、按压 30~80ms 随机。修改后下一轮即时生效。</string>
+
+    <string name="section_target">定位与目标</string>
+    <string name="label_target_package">目标应用包名</string>
+    <string name="target_package_hint">com.ss.android.ugc.aweme</string>
+    <string name="target_safety_hint">只会读取和操作这个包名的窗口；其他应用绝不触碰。非必要不要修改。</string>
+    <string name="label_calibration">坐标校准（节点定位失败时兜底）</string>
+    <string name="calibration_unset">尚未校准。建议进入抖音直播间后校准一次。</string>
+    <string name="calibration_set">输入框 %1$d%%, %2$d%% · 发送按钮 %3$d%%, %4$d%%</string>
+    <string name="action_calibrate">开始校准</string>
+    <string name="calibration_note">校准层是半透明覆盖，不会拦截抖音操作；请先进入直播间，再拖动带颜色的十字准星。</string>
+
+    <string name="section_tools">日志与帮助</string>
+    <string name="action_open_logs">查看运行日志</string>
+    <string name="usage_title">使用步骤</string>
+    <string name="usage_body">1. 按上方卡片依次开启悬浮窗、通知和无障碍权限。\n2. 进入抖音直播间，确认评论输入框显示“说点什么…”。\n3. 建议先用两个十字准星校准「输入框」和「发送按钮」中心。\n4. 回到本页点「开始」，再切回抖音；或直接点悬浮球后按「开始」。\n5. 在悬浮面板可一键「试一轮」并在日志里查看每一步结果；「抓节点」会把当前窗口树写到 Download 并弹出分享。\n6. 停止会清空已发送计数；暂停会保留状态，可直接继续。</string>
+    <string name="disclaimer">免责声明：仅供本人自用与调试。频繁刷屏可能违反平台规则，导致限流或封号；请控制频率并自行承担使用风险。本工具不包含风控绕过、Hook、改包名或模拟器伪装。</string>
+
+    <string name="action_save">保存设置</string>
+    <string name="saved_toast">设置已保存，下一轮生效</string>
+    <string name="messages_empty_toast">至少保留一条非空消息</string>
+    <string name="service_not_ready_toast">无障碍服务未连接，请先开启权限</string>
+    <string name="overlay_permission_needed">需要先授予悬浮窗权限</string>
+    <string name="accessibility_permission_needed">需要先开启无障碍服务</string>
+    <string name="overlay_restore_hint">可从本页「显示 / 恢复悬浮窗」再次打开</string>
+
+    <string name="logs_title">运行日志</string>
+    <string name="logs_empty">暂无日志。开始运行或试一轮后，这里会记录定位节点、点击坐标与失败原因。</string>
+    <string name="logs_copy">一键复制</string>
+    <string name="logs_share">分享</string>
+    <string name="logs_refresh">刷新</string>
+    <string name="logs_clear">清空</string>
+    <string name="logs_copied">日志已复制</string>
+    <string name="logs_share_title">分享抖屏助手日志</string>
+    <string name="logs_clear_confirm">确定清空全部日志？</string>
+    <string name="back">返回</string>
+    <string name="confirm">确定</string>
+    <string name="cancel">取消</string>
+</resources>

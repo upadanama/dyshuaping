@@ -1,0 +1,32 @@
+# Built output
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+
+# Gradle / Android build directories
+.gradle/
+build/
+app/build/
+dist/
+
+# Android SDK local configuration
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.navigation/
+.DS_Store
+
+# OS / logs
+*.log
+*.hprof
+
+# Kotlin daemon/session caches
+.kotlin/
