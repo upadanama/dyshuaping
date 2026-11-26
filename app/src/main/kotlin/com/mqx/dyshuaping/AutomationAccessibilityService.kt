@@ -1,9 +1,12 @@
 package com.mqx.dyshuaping
 
 import android.accessibilityservice.AccessibilityService
-import android.content.ComponentName
+import android.accessibilityservice.GestureDescription
 import android.content.Context
 import android.content.res.Configuration
+import android.graphics.Path
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.view.accessibility.AccessibilityEvent
 import android.view.inputmethod.InputMethodManager
@@ -21,6 +24,9 @@ class AutomationAccessibilityService : AccessibilityService() {
 
     private var overlay: FloatingOverlay? = null
     private var calibrationInProgress = false
+    private var calibrationBackgroundPackage: String? = null
+    private var calibrationOverlayWasVisible = false
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -84,10 +90,9 @@ class AutomationAccessibilityService : AccessibilityService() {
         engine = null
         instance = null
         calibrationInProgress = false
-        try {
-            CalibrationOverlay.cancelActive()
-        } catch (_: Throwable) {
-        }
+        calibrationBackgroundPackage = null
+        calibrationOverlayWasVisible = false
+        mainHandler.removeCallbacksAndMessages(null)
         ControlService.stop(this)
         super.onDestroy()
     }
@@ -118,35 +123,102 @@ class AutomationAccessibilityService : AccessibilityService() {
 
     fun hasOverlay(): Boolean = overlay?.isShowing() == true
 
-    fun startCalibration(onFinished: (() -> Unit)? = null): Boolean {
+    fun startCalibration(): Boolean {
         if (calibrationInProgress) return false
-        if (!Settings.canDrawOverlays(this)) {
-            toast("请先授予悬浮窗权限")
+        val target = AppConfig.load(this).targetPackage
+        val active = NodeTools.activePackage(this)
+        if (active == null || active != target) {
+            toast("请先进入抖音直播间，再从悬浮窗点「校准坐标」")
             return false
         }
+
         calibrationInProgress = true
+        calibrationBackgroundPackage = target
         engine?.pause()
         val wasOverlayVisible = overlay?.isShowing() == true
-        if (wasOverlayVisible) overlay?.hide(showToast = false)
-        val started = CalibrationOverlay.start(this) { saved ->
+        calibrationOverlayWasVisible = wasOverlayVisible
+        // Launch while the overlay is still visible: the visible overlay window is
+        // what permits a background activity launch on Android 10+.
+        val started = CalibrationActivity.launch(this)
+        if (started) {
+            // Keep the overlay visible until CalibrationActivity.onCreate calls
+            // onCalibrationActivityOpened(); a visible overlay is the background
+            // activity launch exemption we rely on here.
+            toast("校准层已打开；手指点哪儿准星就去哪儿")
+            mainHandler.postDelayed({
+                if (calibrationInProgress && !CalibrationActivity.isRunning()) {
+                    calibrationInProgress = false
+                    calibrationBackgroundPackage = null
+                    if (calibrationOverlayWasVisible) ensureOverlay()
+                    calibrationOverlayWasVisible = false
+                    LogStore.add("校准", "校准界面启动超时，已恢复悬浮窗")
+                    toast("未能打开校准界面，请重试")
+                }
+            }, 2500L)
+        } else {
             calibrationInProgress = false
-            if (wasOverlayVisible) ensureOverlay()
-            if (saved) {
-                toast("校准已保存，可回到悬浮窗继续")
-            } else {
-                toast("已取消校准")
-            }
-            try {
-                onFinished?.invoke()
-            } catch (_: Throwable) {
-            }
-        }
-        if (!started) {
-            calibrationInProgress = false
-            if (wasOverlayVisible) ensureOverlay()
-            toast("无法打开校准层，请检查悬浮窗权限")
+            calibrationBackgroundPackage = null
+            calibrationOverlayWasVisible = false
+            toast("无法打开校准界面，请检查悬浮窗权限")
         }
         return started
+    }
+
+    fun onCalibrationActivityOpened() {
+        if (!calibrationInProgress) return
+        overlay?.hide(showToast = false)
+    }
+
+    fun onCalibrationScreenFinished() {
+        mainHandler.removeCallbacksAndMessages(null)
+        if (!calibrationInProgress) return
+        calibrationInProgress = false
+        calibrationBackgroundPackage = null
+        val restoreOverlay = calibrationOverlayWasVisible
+        calibrationOverlayWasVisible = false
+        if (restoreOverlay) {
+            ensureOverlay()
+        }
+        LogStore.add("校准", "校准界面已关闭")
+    }
+
+    fun canTestCalibrationClick(): Boolean {
+        if (!calibrationInProgress) return false
+        val target = AppConfig.load(this).targetPackage
+        return calibrationBackgroundPackage == target
+    }
+
+    /**
+     * Manual test tap from the calibration screen. The calibration Activity makes
+     * its own window non-touchable before calling this, so the injected gesture
+     * can reach the live room underneath.
+     */
+    fun dispatchCalibrationTestClick(x: Int, y: Int): Boolean {
+        if (!canTestCalibrationClick()) {
+            toast("未确认抖音在后台，测试点击已取消")
+            return false
+        }
+        val screen = ScreenUtils.realSize(this)
+        val cx = x.coerceIn(0, screen.x - 1)
+        val cy = y.coerceIn(0, screen.y - 1)
+        val path = Path().apply {
+            moveTo(cx.toFloat(), cy.toFloat())
+            lineTo(
+                (cx + 1).coerceAtMost(screen.x - 1).toFloat(),
+                (cy + 1).coerceAtMost(screen.y - 1).toFloat()
+            )
+        }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0L, 50L))
+            .build()
+        val accepted = try {
+            dispatchGesture(gesture, null, null)
+        } catch (t: Throwable) {
+            LogStore.add("校准", "测试点击异常：${t.javaClass.simpleName}: ${t.message}")
+            false
+        }
+        LogStore.add("校准", "测试点击坐标=($cx,$cy) accepted=$accepted")
+        return accepted
     }
 
     private fun isInputMethodPackage(packageName: String): Boolean {

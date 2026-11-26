@@ -33,6 +33,15 @@
             android:exported="false"
             android:screenOrientation="portrait" />
 
+        <activity
+            android:name=".CalibrationActivity"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:taskAffinity="com.mqx.dyshuaping.calibration"
+            android:theme="@style/Theme.Dyshuaping.Calibration" />
+
         <service
             android:name=".AutomationAccessibilityService"
             android:exported="true"

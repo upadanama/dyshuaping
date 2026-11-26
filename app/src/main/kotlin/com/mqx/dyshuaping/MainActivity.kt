@@ -25,6 +25,7 @@ import android.widget.SeekBar
 import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
+import java.util.Locale
 import kotlin.math.roundToInt
 
 class MainActivity : Activity() {
@@ -61,10 +62,12 @@ class MainActivity : Activity() {
     private lateinit var layoutSuffixTypes: View
     private lateinit var tvSuffixCount: TextView
     private lateinit var sbSuffixCount: SeekBar
-    private lateinit var tvIntervalMin: TextView
-    private lateinit var sbIntervalMin: SeekBar
-    private lateinit var tvIntervalMax: TextView
-    private lateinit var sbIntervalMax: SeekBar
+    private lateinit var etIntervalMin: EditText
+    private lateinit var etIntervalMax: EditText
+    private lateinit var tvTimingPreview: TextView
+    private lateinit var swJitter: Switch
+    private lateinit var layoutJitterMax: View
+    private lateinit var etJitterMax: EditText
     private lateinit var etTargetPackage: EditText
     private lateinit var tvCalibration: TextView
     private lateinit var btnCalibrate: TextView
@@ -73,7 +76,7 @@ class MainActivity : Activity() {
 
     private val uiHandler = Handler(Looper.getMainLooper())
     private var tickerRunning = false
-    private var updatingTiming = false
+    private var updatingTimingFields = false
     private var lastAccessibilityEnabled = false
     private var lastOverlayGranted = false
     private var storageRequested = false
@@ -84,6 +87,10 @@ class MainActivity : Activity() {
 
     private val saveTargetRunnable = Runnable {
         persistTargetIfValid()
+    }
+
+    private val saveTimingRunnable = Runnable {
+        applyTimingInputs(rewriteFields = false, showToast = true)
     }
 
     private val quickTicker = object : Runnable {
@@ -131,6 +138,7 @@ class MainActivity : Activity() {
         persistMessages()
         persistTargetIfValid()
         persistSingleShotText()
+        applyTimingInputs(rewriteFields = false, showToast = false)
         stopQuickTicker()
         super.onPause()
     }
@@ -160,10 +168,12 @@ class MainActivity : Activity() {
         layoutSuffixTypes = findViewById(R.id.layoutSuffixTypes)
         tvSuffixCount = findViewById(R.id.tvSuffixCount)
         sbSuffixCount = findViewById(R.id.sbSuffixCount)
-        tvIntervalMin = findViewById(R.id.tvIntervalMin)
-        sbIntervalMin = findViewById(R.id.sbIntervalMin)
-        tvIntervalMax = findViewById(R.id.tvIntervalMax)
-        sbIntervalMax = findViewById(R.id.sbIntervalMax)
+        etIntervalMin = findViewById(R.id.etIntervalMin)
+        etIntervalMax = findViewById(R.id.etIntervalMax)
+        tvTimingPreview = findViewById(R.id.tvTimingPreview)
+        swJitter = findViewById(R.id.swJitter)
+        layoutJitterMax = findViewById(R.id.layoutJitterMax)
+        etJitterMax = findViewById(R.id.etJitterMax)
         etTargetPackage = findViewById(R.id.etTargetPackage)
         tvCalibration = findViewById(R.id.tvCalibration)
         btnCalibrate = findViewById(R.id.btnCalibrate)
@@ -182,13 +192,16 @@ class MainActivity : Activity() {
         cbSuffixEmoji.isChecked = settings.suffixEmoji
         sbSuffixCount.max = 2
         sbSuffixCount.progress = settings.suffixCount - 1
-        sbIntervalMin.max = 59
-        sbIntervalMax.max = 59
-        sbIntervalMin.progress = settings.intervalMinSec - 1
-        sbIntervalMax.progress = settings.intervalMaxSec - 1
+        setTimingFields(
+            settings.intervalMinTenths,
+            settings.intervalMaxTenths,
+            settings.jitterEnabled,
+            settings.jitterMaxTenths
+        )
+        updateJitterVisibility()
+        updateTimingPreview(settings.intervalMinTenths, settings.intervalMaxTenths)
         etTargetPackage.setText(settings.targetPackage)
         tvSuffixCount.text = getString(R.string.label_suffix_count, settings.suffixCount)
-        updateTimingLabels()
         updateSuffixEnabledVisuals()
     }
 
@@ -245,39 +258,34 @@ class MainActivity : Activity() {
             override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
         })
 
-        sbIntervalMin.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                if (updatingTiming) return
-                updatingTiming = true
-                val min = progress + 1
-                if (min > sbIntervalMax.progress + 1) {
-                    sbIntervalMax.progress = min - 1
-                }
-                updateTimingLabels()
-                persistIntervals()
-                updatingTiming = false
+        val timingWatcher = object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = Unit
+            override fun afterTextChanged(s: Editable?) {
+                if (updatingTimingFields) return
+                refreshTimingPreviewFromFields()
+                uiHandler.removeCallbacks(saveTimingRunnable)
+                uiHandler.postDelayed(saveTimingRunnable, 500L)
             }
-
-            override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
-            override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
-        })
-
-        sbIntervalMax.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                if (updatingTiming) return
-                updatingTiming = true
-                val max = progress + 1
-                if (max < sbIntervalMin.progress + 1) {
-                    sbIntervalMin.progress = max - 1
-                }
-                updateTimingLabels()
-                persistIntervals()
-                updatingTiming = false
+        }
+        etIntervalMin.addTextChangedListener(timingWatcher)
+        etIntervalMax.addTextChangedListener(timingWatcher)
+        etJitterMax.addTextChangedListener(timingWatcher)
+        val timingFocus = View.OnFocusChangeListener { _, hasFocus ->
+            if (!hasFocus) {
+                applyTimingInputs(rewriteFields = true, showToast = true)
             }
-
-            override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
-            override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
-        })
+        }
+        etIntervalMin.setOnFocusChangeListener(timingFocus)
+        etIntervalMax.setOnFocusChangeListener(timingFocus)
+        etJitterMax.setOnFocusChangeListener(timingFocus)
+        swJitter.setOnCheckedChangeListener { _, _ ->
+            updateJitterVisibility()
+            refreshTimingPreviewFromFields()
+            if (!updatingTimingFields) {
+                applyTimingInputs(rewriteFields = false, showToast = false)
+            }
+        }
 
         etTargetPackage.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
@@ -406,13 +414,142 @@ class MainActivity : Activity() {
         updateSuffixEnabledVisuals()
     }
 
-    private fun persistIntervals() {
-        AppConfig.saveIntervals(
-            this,
-            sbIntervalMin.progress + 1,
-            sbIntervalMax.progress + 1
-        )
+    private fun setTimingFields(
+        minTenths: Int,
+        maxTenths: Int,
+        jitterEnabled: Boolean,
+        jitterMaxTenths: Int
+    ) {
+        updatingTimingFields = true
+        etIntervalMin.setText(formatSeconds(minTenths))
+        etIntervalMax.setText(formatSeconds(maxTenths))
+        swJitter.isChecked = jitterEnabled
+        etJitterMax.setText(formatSeconds(jitterMaxTenths))
+        updatingTimingFields = false
     }
+
+    private fun updateJitterVisibility() {
+        layoutJitterMax.visibility = if (swJitter.isChecked) View.VISIBLE else View.GONE
+    }
+
+    private fun refreshTimingPreviewFromFields() {
+        val minRaw = parseSecondsToTenths(etIntervalMin.text?.toString().orEmpty())
+        val maxRaw = parseSecondsToTenths(etIntervalMax.text?.toString().orEmpty())
+        if (minRaw == null || maxRaw == null) {
+            val saved = AppConfig.load(this)
+            updateTimingPreview(saved.intervalMinTenths, saved.intervalMaxTenths)
+            return
+        }
+        var min = minRaw.coerceIn(1, 600)
+        var max = maxRaw.coerceIn(1, 600)
+        if (min > max) max = min
+        updateTimingPreview(min, max)
+    }
+
+    private fun updateTimingPreview(minTenths: Int, maxTenths: Int) {
+        val jitterEnabled = swJitter.isChecked
+        val jitterTenths = if (jitterEnabled) {
+            val parsed = parseSecondsToTenths(etJitterMax.text?.toString().orEmpty())
+            (parsed ?: AppConfig.load(this).jitterMaxTenths).coerceIn(1, 600)
+        } else {
+            0
+        }
+        tvTimingPreview.text = if (jitterEnabled) {
+            getString(
+                R.string.timing_preview_jitter,
+                formatSeconds(minTenths),
+                formatSeconds(maxTenths),
+                formatSeconds(jitterTenths)
+            )
+        } else {
+            getString(
+                R.string.timing_preview_no_jitter,
+                formatSeconds(minTenths),
+                formatSeconds(maxTenths)
+            )
+        }
+    }
+
+    private fun applyTimingInputs(rewriteFields: Boolean, showToast: Boolean): Boolean {
+        if (updatingTimingFields) return false
+        uiHandler.removeCallbacks(saveTimingRunnable)
+        val minRaw = parseSecondsToTenths(etIntervalMin.text?.toString().orEmpty())
+        val maxRaw = parseSecondsToTenths(etIntervalMax.text?.toString().orEmpty())
+        if (minRaw == null || maxRaw == null) {
+            if (rewriteFields) {
+                toast(getString(R.string.timing_input_invalid))
+                val saved = AppConfig.load(this)
+                setTimingFields(
+                    saved.intervalMinTenths,
+                    saved.intervalMaxTenths,
+                    saved.jitterEnabled,
+                    saved.jitterMaxTenths
+                )
+                updateJitterVisibility()
+                updateTimingPreview(saved.intervalMinTenths, saved.intervalMaxTenths)
+            }
+            return false
+        }
+
+        var rangeCorrected = false
+        var boundsCorrected = false
+        var min = minRaw.coerceIn(1, 600)
+        var max = maxRaw.coerceIn(1, 600)
+        if (min != minRaw || max != maxRaw) {
+            rangeCorrected = true
+        }
+        if (min > max) {
+            max = min
+            boundsCorrected = true
+        }
+
+        val jitterEnabled = swJitter.isChecked
+        val jitterRaw = parseSecondsToTenths(etJitterMax.text?.toString().orEmpty())
+        val savedJitter = AppConfig.load(this).jitterMaxTenths
+        var jitterMax = if (jitterEnabled) {
+            if (jitterRaw == null) {
+                if (rewriteFields) {
+                    toast(getString(R.string.timing_input_invalid))
+                    val saved = AppConfig.load(this)
+                    setTimingFields(
+                        saved.intervalMinTenths,
+                        saved.intervalMaxTenths,
+                        saved.jitterEnabled,
+                        saved.jitterMaxTenths
+                    )
+                    updateJitterVisibility()
+                    updateTimingPreview(saved.intervalMinTenths, saved.intervalMaxTenths)
+                }
+                return false
+            }
+            val clamped = jitterRaw.coerceIn(1, 600)
+            if (clamped != jitterRaw) rangeCorrected = true
+            clamped
+        } else {
+            (jitterRaw ?: savedJitter).coerceIn(1, 600)
+        }
+
+        AppConfig.saveTiming(this, min, max, jitterEnabled, jitterMax)
+        if (rewriteFields) {
+            setTimingFields(min, max, jitterEnabled, jitterMax)
+        }
+        updateJitterVisibility()
+        updateTimingPreview(min, max)
+        if (showToast) {
+            if (rangeCorrected) toast(getString(R.string.timing_value_range_error))
+            if (boundsCorrected) toast(getString(R.string.timing_min_max_error))
+        }
+        return true
+    }
+
+    private fun parseSecondsToTenths(text: String): Int? {
+        val value = text.trim().replace(',', '.').toDoubleOrNull() ?: return null
+        if (value.isNaN() || value.isInfinite()) return null
+        return (value * 10.0).roundToInt()
+    }
+
+    private fun formatSeconds(tenths: Int): String =
+        String.format(Locale.US, "%.1f", tenths / 10.0)
 
     private fun updateSuffixEnabledVisuals() {
         val enabled = swSuffix.isChecked
@@ -422,13 +559,6 @@ class MainActivity : Activity() {
         cbSuffixEmoji.isEnabled = enabled
         sbSuffixCount.isEnabled = enabled
         tvSuffixCount.alpha = if (enabled) 1f else 0.4f
-    }
-
-    private fun updateTimingLabels() {
-        val min = sbIntervalMin.progress + 1
-        val max = sbIntervalMax.progress + 1
-        tvIntervalMin.text = getString(R.string.label_interval_min, min)
-        tvIntervalMax.text = getString(R.string.label_interval_max, max)
     }
 
     private fun saveAllSettings(showFeedback: Boolean): Boolean {
@@ -444,12 +574,13 @@ class MainActivity : Activity() {
             return false
         }
         etSingleShotText.error = null
+        if (!applyTimingInputs(rewriteFields = true, showToast = showFeedback)) {
+            return false
+        }
         AppConfig.saveMessages(this, messages)
         AppConfig.saveSingleShotText(this, singleShot)
         persistSuffix()
-        persistIntervals()
         AppConfig.saveRandomMode(this, rgMode.checkedRadioButtonId == R.id.rbRandom)
-        updateTimingLabels()
         updateSuffixEnabledVisuals()
         if (!hasMessages) {
             if (showFeedback) toast(getString(R.string.messages_empty_toast))
@@ -608,22 +739,14 @@ class MainActivity : Activity() {
             return
         }
         val service = AutomationAccessibilityService.instance
-        if (service != null) {
-            val started = service.startCalibration {
-                updateCalibrationSummary()
-            }
-            if (!started) {
-                toast("校准层未打开，请稍后重试")
-            }
+        if (service == null) {
+            toast("请先开启无障碍服务，并进入抖音直播间后从悬浮窗点「校准坐标」")
             return
         }
-        val started = CalibrationOverlay.start(this) { saved ->
-            updateCalibrationSummary()
-            if (saved) toast("校准已保存") else toast("已取消校准")
-        }
-        if (!started) {
-            toast("无法打开校准层，请检查悬浮窗权限")
-        }
+        // The calibration Activity is launched from the overlay while the live room
+        // is foreground. From this page the target is not foreground, so it will
+        // normally reject the request and show the guided toast.
+        service.startCalibration()
     }
 
     private fun handleNotificationPermissionClick() {

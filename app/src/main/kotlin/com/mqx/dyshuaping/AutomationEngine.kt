@@ -12,6 +12,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.Toast
+import java.util.Locale
 import java.util.Random
 import kotlin.math.ceil
 
@@ -373,11 +374,10 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
     private fun scheduleInitialRound(fromResume: Boolean) {
         if (phase != Phase.RUNNING || trialRunning || destroyed) return
         cancelPendingCallbacks()
-        val jitter = randomBetween(0, 800).toLong()
-        nextRoundAtElapsed = SystemClock.elapsedRealtime() + jitter
+        nextRoundAtElapsed = 0L
         statusMessage = if (fromResume) "回到抖音，准备继续" else "准备开始"
         notifyChanged()
-        later(jitter) { beginRound(isTrial = false) }
+        beginRound(isTrial = false)
     }
 
     private fun scheduleNextRound() {
@@ -392,14 +392,22 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
             return
         }
         cancelPendingCallbacks()
-        val intervalMs = randomBetween(settings.intervalMinSec, settings.intervalMaxSec).toLong() * 1000L
-        val jitterMs = randomBetween(0, 800).toLong()
+        val intervalMinMs = settings.intervalMinTenths * 100L
+        val intervalMaxMs = settings.intervalMaxTenths * 100L
+        val intervalMs = randomLongBetween(intervalMinMs, intervalMaxMs)
+        val jitterLimitMs = if (settings.jitterEnabled) settings.jitterMaxTenths * 100L else 0L
+        val jitterMs = if (jitterLimitMs > 0L) randomLongBetween(0L, jitterLimitMs) else 0L
         val delay = intervalMs + jitterMs
         nextRoundAtElapsed = SystemClock.elapsedRealtime() + delay
         statusMessage = "等待下一轮"
+        val jitterText = if (settings.jitterEnabled) {
+            "抖动 +${formatSeconds(jitterMs)}秒（上限 ${formatSeconds(settings.jitterMaxTenths * 100L)}秒）"
+        } else {
+            "抖动已关闭"
+        }
         LogStore.add(
             "节奏",
-            "下一轮等待 ${"%.1f".format(delay / 1000.0)} 秒（间隔 ${settings.intervalMinSec}~${settings.intervalMaxSec}s + 抖动 ${jitterMs}ms）"
+            "下一轮等待 ${formatSeconds(delay)} 秒（区间 ${formatSeconds(intervalMinMs)}~${formatSeconds(intervalMaxMs)}秒，$jitterText）"
         )
         notifyChanged()
         later(delay) { beginRound(isTrial = false) }
@@ -1264,6 +1272,16 @@ class AutomationEngine(private val service: AutomationAccessibilityService) {
         val high = maxOf(min, max)
         return low + random.nextInt(high - low + 1)
     }
+
+    private fun randomLongBetween(min: Long, max: Long): Long {
+        val low = minOf(min, max)
+        val high = maxOf(min, max)
+        if (high <= low) return low
+        return low + (random.nextDouble() * (high - low + 1)).toLong()
+    }
+
+    private fun formatSeconds(milliseconds: Long): String =
+        String.format(Locale.US, "%.1f", milliseconds / 1000.0)
 
     private fun toast(message: String) {
         try {

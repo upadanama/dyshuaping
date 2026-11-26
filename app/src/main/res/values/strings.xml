@@ -9,7 +9,7 @@
     <string name="notification_title">抖屏助手</string>
 
     <string name="main_title">抖屏助手</string>
-    <string name="main_subtitle">抖音直播间自动评论 · 本机调试版 v1.1.0</string>
+    <string name="main_subtitle">抖音直播间自动评论 · 本机调试版 v1.2.0</string>
     <string name="section_permissions">运行权限</string>
     <string name="permission_overlay_title">悬浮窗权限</string>
     <string name="permission_overlay_desc">显示开始 / 暂停 / 停止悬浮面板</string>
@@ -71,9 +71,20 @@
     <string name="suffix_recent_hint">最近 20 条已用的完整后缀会尽量避开；组合不足时可能重复。</string>
 
     <string name="section_timing">发送节奏</string>
-    <string name="label_interval_min">最小间隔：%1$d 秒</string>
-    <string name="label_interval_max">最大间隔：%1$d 秒</string>
-    <string name="timing_hint">实际等待 = 随机间隔 + 每轮开始 0~800ms 抖动；点击坐标 ±3px、按压 30~80ms 随机。修改后下一轮即时生效。</string>
+    <string name="label_interval_min">最小间隔（秒）</string>
+    <string name="label_interval_max">最大间隔（秒）</string>
+    <string name="hint_interval_min_value">2.0</string>
+    <string name="hint_interval_max_value">5.0</string>
+    <string name="label_jitter_enabled">启用发送抖动</string>
+    <string name="label_jitter_max">抖动上限（秒）</string>
+    <string name="hint_jitter_max_value">0.5</string>
+    <string name="timing_preview_jitter">实际间隔 %1$s ~ %2$s 秒（抖动最多再加 %3$s 秒）</string>
+    <string name="timing_preview_no_jitter">实际间隔 %1$s ~ %2$s 秒（抖动已关闭）</string>
+    <string name="timing_hint">范围 0.1~60.0 秒，步进 0.1；关闭抖动时严格按区间随机，不再叠加任何额外延迟。点击坐标 ±3px、按压 30~80ms 随机。修改后下一轮即时生效。</string>
+    <string name="timing_value_range_error">间隔和抖动需在 0.1~60.0 秒之间，已自动修正</string>
+    <string name="timing_min_max_error">最小值不能大于最大值，已自动调整</string>
+    <string name="timing_input_invalid">请输入 0.1~60.0 之间的秒数</string>
+    <string name="unit_seconds">秒</string>
 
     <string name="section_target">定位与目标</string>
     <string name="label_target_package">目标应用包名</string>
@@ -83,12 +94,12 @@
     <string name="calibration_unset">尚未校准。建议进入抖音直播间后校准一次。</string>
     <string name="calibration_set">输入框 %1$d%%, %2$d%% · 发送按钮 %3$d%%, %4$d%%</string>
     <string name="action_calibrate">开始校准</string>
-    <string name="calibration_note">校准层是半透明覆盖，不会拦截抖音操作；请先进入直播间，再拖动带颜色的十字准星。</string>
+    <string name="calibration_note">请先进入抖音直播间，再从悬浮窗点「校准坐标」；校准层全屏，手指点哪儿准星就去哪儿，可用微调按钮和测试点击。</string>
 
     <string name="section_tools">日志与帮助</string>
     <string name="action_open_logs">查看运行日志</string>
     <string name="usage_title">使用步骤</string>
-    <string name="usage_body">1. 按上方卡片依次开启悬浮窗、通知和无障碍权限。\n2. 进入抖音直播间，确认评论输入框显示“说点什么…”。\n3. 建议先用两个十字准星校准「输入框」和「发送按钮」中心。\n4. 回到本页点「开始」，再切回抖音；或直接点悬浮球后按「开始」。\n5. 在悬浮面板可一键「试一轮」并在日志里查看每一步结果；「抓节点」会把当前窗口树写到 Download 并弹出分享。\n6. 停止会清空已发送计数；暂停会保留状态，可直接继续。</string>
+    <string name="usage_body">1. 按上方卡片依次开启悬浮窗、通知和无障碍权限。\n2. 进入抖音直播间，确认评论输入框显示“说点什么…”。\n3. 建议在抖音直播间内从悬浮窗点「校准坐标」，用全屏准星校准「输入框」和「发送按钮」中心。\n4. 回到本页点「开始」，再切回抖音；或直接点悬浮球后按「开始」。\n5. 在悬浮面板可一键「试一轮」并在日志里查看每一步结果；「抓节点」会把当前窗口树写到 Download 并弹出分享。\n6. 停止会清空已发送计数；暂停会保留状态，可直接继续。</string>
     <string name="disclaimer">免责声明：仅供本人自用与调试。频繁刷屏可能违反平台规则，导致限流或封号；请控制频率并自行承担使用风险。本工具不包含风控绕过、Hook、改包名或模拟器伪装。</string>
 
     <string name="action_save">保存设置</string>
